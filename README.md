@@ -6,6 +6,14 @@ A professional embedded systems project demonstrating HAL-based GPIO control, st
 
 This project implements a sequential LED controller that creates an engaging light show using the three onboard LEDs of the NUCLEO-F767ZI development board. The system demonstrates fundamental embedded programming concepts including button debouncing, state machine design, and responsive user interface implementation.
 
+### 🎬 Live Demonstration
+
+Watch the LED sequence controller in action! The demonstration shows the complete sequence cycle and interactive button control:
+
+![LED Sequence Demo](./demonstration/led_sequence_demo.gif)
+
+*Press the blue user button to start the sequence: Green → Green+Blue → All LEDs → Blue+Red → Red → Off. Press the button during execution to immediately stop the sequence.*
+
 ### Key Learning Objectives
 
 This project serves as a comprehensive introduction to professional embedded systems development, covering essential concepts that form the foundation for more advanced embedded programming:
