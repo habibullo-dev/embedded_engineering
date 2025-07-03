@@ -1,6 +1,6 @@
 # STM32F767ZI Embedded Systems Learning Journey
 
-> **Professional embedded development progression from basic GPIO control to advanced interrupt-driven programming**
+> **Professional embedded development progression from basic GPIO control to advanced system programming**
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![STM32](https://img.shields.io/badge/STM32-F767ZI-orange.svg)](https://www.st.com/en/microcontrollers-microprocessors/stm32f767zi.html)
@@ -8,12 +8,12 @@
 
 ## 🎯 Project Mission
 
-This repository documents a comprehensive embedded systems learning journey, progressing from fundamental GPIO operations to advanced interrupt-driven architectures. Each implementation demonstrates professional development practices while building essential embedded programming skills.
+This repository documents a comprehensive embedded systems learning journey, progressing from fundamental GPIO operations to advanced interrupt-driven architectures and system programming. Each implementation demonstrates professional development practices while building essential embedded programming skills.
 
 ## 📋 Learning Implementations
 
-### 🔄 Polling-Based Implementation
-**Foundation Level - Direct Hardware Control**
+### 🔄 [Polling-Based LED Controller](https://github.com/habibullo-dev/embedded_engineering/tree/feature/polling-implementation)
+**Foundation Level - State Machine & Hardware Control**
 
 - **Core Concepts**: HAL GPIO programming, state machines, non-blocking timing
 - **Architecture**: Sequential main loop with continuous input monitoring
@@ -31,7 +31,7 @@ while (1) {
 }
 ```
 
-### ⚡ Interrupt-Driven Implementation  
+### ⚡ [Interrupt-Driven LED Controller](https://github.com/habibullo-dev/embedded_engineering/tree/feature/interrupt-implementation)
 **Advanced Level - Event-Driven Architecture**
 
 - **Core Concepts**: GPIO interrupts, NVIC management, ISR design
@@ -46,12 +46,34 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 }
 ```
 
+### 🖥️ [Professional Shell Interface](https://github.com/habibullo-dev/embedded_engineering/tree/feature/shell-implementation)
+**System Level - UART Communication & Command Processing**
+
+- **Core Concepts**: UART programming, command parsing, session management
+- **Architecture**: Interrupt-driven UART with command-line interface
+- **Key Skills**: String processing, circular buffers, terminal protocols
+- **Features**: Authentication, command history, LED control, system monitoring
+
+```c
+// Advanced shell with full editing capabilities
+void process_character(char c) {
+    if (c == '\r' || c == '\n') {
+        process_command();
+    } else if (c == 127 || c == 8) {
+        delete_char_at_cursor();
+    } else {
+        insert_char_at_cursor(c);
+    }
+}
+```
+
 ## 🛠️ Hardware Platform
 
 **Target Board**: NUCLEO-F767ZI Development Board
 - **Microcontroller**: STM32F767ZI (Cortex-M7, 216MHz)
 - **LEDs**: 3x onboard (Green PB0, Blue PB7, Red PB14)
 - **Button**: User button PC13 (active LOW)
+- **Communication**: UART4 for terminal interface
 - **Programmer**: Integrated ST-Link
 
 ## 🔧 Development Environment
@@ -61,22 +83,23 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 - **Library**: STM32F7 HAL
 - **Toolchain**: ARM GCC
 
-## 📊 Performance Comparison
+## 📊 Implementation Comparison
 
-| Metric | Polling | Interrupt |
-|--------|---------|-----------|
-| **Response Time** | 0-20ms | <1ms |
-| **CPU Efficiency** | 90% checking | 99% idle |
-| **Event Detection** | Can miss brief events | Never misses |
-| **Power Consumption** | Higher | Lower |
-| **Code Complexity** | Simple | Advanced |
+| Feature | Polling | Interrupt | Shell |
+|---------|---------|-----------|-------|
+| **Response Time** | 0-20ms | <1ms | <1ms |
+| **CPU Efficiency** | 90% checking | 99% idle | 95% idle |
+| **Event Detection** | Can miss brief events | Never misses | Never misses |
+| **User Interface** | LED only | LED only | Full CLI |
+| **Code Complexity** | Simple | Advanced | Professional |
+| **System Features** | Basic | Basic | Authentication, Logging |
 
 ## 🎓 Key Learning Outcomes
 
 ### Hardware Abstraction Layer (HAL)
 - Direct GPIO configuration without BSP dependencies
 - Clock management and peripheral initialization
-- Portable code design principles
+- UART communication and interrupt handling
 
 ### State Machine Design
 - Finite state machine implementation
@@ -88,34 +111,43 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 - ISR design best practices
 - Safe inter-context communication
 
+### System Programming
+- Command-line interface development
+- Session management and authentication
+- Real-time data processing and logging
+
 ### Professional Practices
-- Version control with Git
+- Version control with Git branching
 - Documentation standards
 - Code organization and modularity
 
 ## 🚀 Quick Start
 
-### Clone and Build
+### Clone and Explore
 ```bash
 git clone https://github.com/habibullo-dev/embedded_engineering
-cd /embedded_engineering
+cd embedded_engineering
 
-# Import to STM32CubeIDE
-# Build and program to NUCLEO-F767ZI
+# Explore different implementations
+git checkout feature/polling-implementation       # Basic GPIO control
+git checkout feature/interrupt-implementation     # Advanced interrupts
+git checkout feature/shell-implementation         # Professional shell
+
+# Import to STM32CubeIDE and build
 ```
 
-### Test Functionality
-1. **Power On**: All LEDs off
-2. **Button Press**: Starts LED sequence (Green → Blue → Red → Off)
-3. **During Sequence**: Button press stops immediately
-4. **Responsiveness**: Compare polling vs interrupt versions
+### Test Each Implementation
+1. **Polling LED Controller**: Button controls LED progression
+2. **Interrupt Version**: Immediate response testing
+3. **Shell Interface**: Connect via UART at 115200 baud, login with `admin/1234`
 
-## 🌟 Repository Highlights
+## 🌟 Repository Structure
 
-### Branch Structure
-- **`main`**: Complete implementations and documentation
-- **`feature/polling-implementation`**: Polling-based development
-- **`feature/interrupt-implementation`**: Interrupt-driven development
+### Branch Organization
+- **`main`**: Complete documentation and project overview
+- **`feature/polling-implementation`**: [Polling-based LED control](https://github.com/habibullo-dev/embedded_engineering/tree/feature/polling-implementation)
+- **`feature/interrupt-implementation`**: [Interrupt-driven development](https://github.com/habibullo-dev/embedded_engineering/tree/feature/interrupt-implementation)
+- **`feature/shell-implementation`**: [Professional shell system](https://github.com/habibullo-dev/embedded_engineering/tree/feature/shell-implementation)
 - **`experiment/*`**: Various timing and configuration experiments
 
 ### Documentation
@@ -139,3 +171,4 @@ This foundation prepares for advanced embedded topics:
 - **DMA Operations**: Direct memory access for efficiency
 - **FreeRTOS Integration**: Real-time operating system concepts
 - **Low Power Modes**: Energy optimization techniques
+- **Bootloader Development**: Firmware update mechanisms
