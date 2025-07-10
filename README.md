@@ -8,12 +8,12 @@ This project implements a professional terminal interface accessible via UART, f
 
 ### Key Features
 
-- **Secure Authentication**: Username/password login system with session management
-- **Advanced Command Line**: Full editing support with cursor movement, backspace, and command history
-- **LED Control**: Direct hardware control with timer-based auto-off functionality
-- **System Monitoring**: Real-time system information, uptime tracking, and activity logging
-- **Professional UI**: Color-coded output with modern terminal aesthetics
-- **Session Management**: Automatic timeout with configurable duration
+- **Secure Authentication**: Username/password login system with session management and logging
+- **Advanced Command Line**: Full editing support with cursor movement, backspace, command history, and in-line editing
+- **LED Control**: Direct hardware control with timer-based auto-off functionality, group/all control, and status feedback
+- **System & Climate Monitoring**: Real-time system information, uptime tracking, activity logging, and live temperature/humidity from HDC1080 sensor
+- **Professional UI**: Color-coded output, modern terminal aesthetics, and dynamic banners
+- **Session Management**: Automatic timeout with configurable duration and auto-logout
 
 ### 🎬 Live Demonstration
 
@@ -80,8 +80,9 @@ The terminal implements a state machine with three main states:
 ### Command System
 
 Available commands include:
-- **System Commands**: `whoami`, `uptime`, `sysinfo`, `time`, `status`
-- **LED Control**: `led on/off [1-3|all]` with optional timer (`-t SEC`)
+- **System Commands**: `whoami`, `uptime`, `status`, `sysinfo`, `time`
+- **LED Control**: `led on|off [1-3|all] [-t SEC]` (with timer and group/all support)
+- **Climate Monitoring**: `climate`, `updateclimate` (live temperature/humidity from HDC1080)
 - **Utility Commands**: `clear`, `history`, `logs`, `help`, `logout`
 
 ## ⚙️ Configuration Options
@@ -105,12 +106,36 @@ Available commands include:
 #define LOG_SIZE 10                // System log entries
 ```
 
+### Logging System
+```c
+typedef enum {
+    LOG_INFO,
+    LOG_SUCCESS,
+    LOG_ERROR,
+    LOG_WARNING,
+    LOG_LOGIN,
+    LOG_SENSOR,
+    LOG_DEBUG
+} log_level_t;
+```
+
 ### LED Configuration
 ```c
 #define LED1_PIN GPIO_PIN_0        // Green LED
 #define LED2_PIN GPIO_PIN_7        // Blue LED  
 #define LED3_PIN GPIO_PIN_14       // Red LED
 #define LED_PORT GPIOB             // LED port
+```
+
+### Climate Sensor (HDC1080)
+```c
+// I2C2 (PF0/PF1) used for HDC1080 temperature/humidity sensor
+#define HDC1080_ADDRESS 0x40
+typedef struct {
+    float temperature;
+    float humidity;
+    uint8_t sensor_ok;
+} HDC1080_Data;
 ```
 
 ## 🚀 Getting Started
@@ -124,17 +149,17 @@ Available commands include:
 ## 🧪 Testing and Validation
 
 ### Functional Testing
-- **Authentication**: Verify login/logout functionality
-- **Command Editing**: Test cursor movement and character insertion/deletion
-- **LED Control**: Confirm hardware control with timer functionality
-- **Session Management**: Verify automatic timeout behavior
-- **History Navigation**: Test command history with arrow keys
-- **System Information**: Validate real-time data display
+- **Authentication**: Verify login/logout functionality and session timeout/auto-logout
+- **Command Editing**: Test cursor movement, in-line editing, and character insertion/deletion
+- **LED Control**: Confirm hardware control, timer, and group/all functionality
+- **Session Management**: Verify automatic timeout and activity logging
+- **History Navigation**: Test command history with arrow keys and duplicate prevention
+- **System & Climate Information**: Validate real-time data display and sensor readings
 
 ### Performance Testing
 - **Responsiveness**: Command execution should be immediate
 - **Memory Usage**: Monitor buffer usage during extended sessions
-- **Timing Accuracy**: Verify LED timers and system clock precision
+- **Timing Accuracy**: Verify LED timers, system clock, and sensor update precision
 
 ## 📡 UART Protocol
 
@@ -142,18 +167,20 @@ The terminal uses standard UART communication with VT100-compatible escape seque
 - **Cursor Control**: `\033[A` (Up), `\033[B` (Down), `\033[C` (Right), `\033[D` (Left)
 - **Screen Control**: `\033[2J` (Clear screen), `\033[K` (Clear line)
 - **Color Codes**: ANSI 256-color palette for professional appearance
+- **Password Masking**: Input characters displayed as asterisks
 
 ## 🔐 Security Features
 
 - **Password Masking**: Input characters displayed as asterisks
-- **Session Timeout**: Automatic logout after inactivity
-- **Command Logging**: All actions logged with timestamps
-- **Input Validation**: Buffer overflow protection and command length limits
+- **Session Timeout**: Automatic logout after inactivity and inactivity warning
+- **Command Logging**: All actions logged with timestamps and log levels
+- **Input Validation**: Buffer overflow protection, command length limits, and duplicate command prevention
+- **Activity Logging**: All login, logout, and error events are logged
 
 ## 🎨 UI Design
 
 The terminal features a modern, professional appearance with:
 - **Color Coding**: Different colors for commands, status, errors, and information
-- **Visual Feedback**: Command validation with color changes
-- **Professional Banner**: Startup screen with system information
-- **Consistent Formatting**: Structured output with clear separators
+- **Professional Banner**: Startup screen with system and climate information
+- **Consistent Formatting**: Structured output with clear separators and status lines
+- **Live Sensor Data**: Real-time temperature/humidity display in banner and on demand
