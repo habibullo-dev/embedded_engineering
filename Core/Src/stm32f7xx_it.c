@@ -204,7 +204,18 @@ void SysTick_Handler(void)
 void UART4_IRQHandler(void)
 {
   /* USER CODE BEGIN UART4_IRQn 0 */
-
+  if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_ORE)) {
+		  __HAL_UART_CLEAR_OREFLAG(&huart4);
+	  }
+  if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_FE)) {
+		  __HAL_UART_CLEAR_FEFLAG(&huart4);
+	  }
+  if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_NE)) {
+		  __HAL_UART_CLEAR_NEFLAG(&huart4);
+	  }
+  if (__HAL_UART_GET_FLAG(&huart4, UART_FLAG_PE)) {
+		  __HAL_UART_CLEAR_PEFLAG(&huart4);
+	  }
   /* USER CODE END UART4_IRQn 0 */
   HAL_UART_IRQHandler(&huart4);
   /* USER CODE BEGIN UART4_IRQn 1 */
