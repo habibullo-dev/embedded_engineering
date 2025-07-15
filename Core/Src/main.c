@@ -1,34 +1,95 @@
-/* main.c - System Entry Point and Main Loop (Refactored Modular Version) */
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body with FreeRTOS Implementation
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
+#include "eth.h"
+#include "i2c.h"
 #include "usart.h"
 #include "usb_otg.h"
 #include "gpio.h"
-#include "i2c.h"
-#include <stdio.h>
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include "queue.h"
+#include "timers.h"
 
 // Application modules
-#include "system_config.h"
-#include "system_logging.h"
-#include "led_control.h"
-#include "sensors.h"
 #include "terminal_ui.h"
+#include "sensors.h"
+#include "led_control.h"
+#include "system_logging.h"
+#include "system_config.h"
+#include "persistent_logging.h"  // Add persistent logging
+/* USER CODE END Includes */
 
-// Global system variables
-volatile uint32_t system_tick = 0;
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+/* USER CODE END PTD */
 
-// Real-time clock for Seoul timezone (UTC+9)
-typedef struct {
-    uint8_t hours;
-    uint8_t minutes;
-    uint8_t seconds;
-    uint16_t day;
-    uint8_t month;
-    uint16_t year;
-} rtc_time_t;
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define TERMINAL_TASK_PRIORITY    3
+#define SENSOR_TASK_PRIORITY      2
+#define LED_TASK_PRIORITY         2
+#define SYSTEM_TASK_PRIORITY      1
 
-// Function prototypes
+#define TERMINAL_STACK_SIZE       1024
+#define SENSOR_STACK_SIZE         512
+#define LED_STACK_SIZE            256
+#define SYSTEM_STACK_SIZE         256
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN PV */
+
+// Global FreeRTOS Objects
+SemaphoreHandle_t uartMutex = NULL;
+SemaphoreHandle_t i2cMutex = NULL;
+
+// Task handles
+TaskHandle_t terminalTaskHandle = NULL;
+TaskHandle_t sensorTaskHandle = NULL;
+TaskHandle_t ledTaskHandle = NULL;
+TaskHandle_t systemTaskHandle = NULL;
+
+// Timers
+TimerHandle_t sensorTimer = NULL;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-void Error_Handler(void);
+void MX_FREERTOS_Init(void);
+
+/* USER CODE BEGIN PFP */
+// Task function prototypes
+void TerminalTask(void *argument);
+void SensorTask(void *argument);
+void LEDTask(void *argument);
+void SystemTask(void *argument);
+
+// Timer callback
+void SensorTimerCallback(TimerHandle_t xTimer);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+/* USER CODE END 0 */
 
 /**
   * @brief  The application entry point.
@@ -36,120 +97,309 @@ void Error_Handler(void);
   */
 int main(void)
 {
-    /* MCU Configuration--------------------------------------------------------*/
-    HAL_Init();
-    SystemClock_Config();
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
 
-    /* Initialize all configured peripherals */
-    MX_GPIO_Init();
-    MX_UART4_Init();
-    MX_USART3_UART_Init();
-    MX_USB_OTG_FS_PCD_Init();
-    MX_I2C2_Init();
+  /* MCU Configuration--------------------------------------------------------*/
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
 
-    /* Application Initialization -----------------------------------------------*/
+  /* USER CODE BEGIN Init */
+  /* USER CODE END Init */
 
-    // Initialize system services
-    SystemLog_Init();
-    SystemLog_Add(LOG_INFO, "main", "System services initialized");
+  /* Configure the system clock */
+  SystemClock_Config();
 
-    // Initialize hardware modules
-    LED_Init();
-    SystemLog_Add(LOG_SUCCESS, "main", "LED control initialized");
+  /* USER CODE BEGIN SysInit */
+  /* USER CODE END SysInit */
 
-    // Initialize terminal interface
-    TerminalUI_Init();
-    SystemLog_Add(LOG_SUCCESS, "main", "Terminal UI initialized");
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_ETH_Init();
+  MX_UART4_Init();
+  MX_USART3_UART_Init();
+  MX_USB_OTG_FS_PCD_Init();
+  MX_I2C2_Init();
 
-    // Initialize sensors (this may fail gracefully)
-    if (Sensors_Init()) {
-        SystemLog_Add(LOG_SUCCESS, "main", "Multi-sensor system ready");
-    } else {
-        SystemLog_Add(LOG_WARNING, "main", "Some sensors failed initialization");
-    }
+  /* USER CODE BEGIN 2 */
 
-    // Show startup banner with live sensor data
-    TerminalUI_ShowBanner();
+  // Verify UART4 interrupt priority is FreeRTOS compatible
+  HAL_NVIC_SetPriority(UART4_IRQn, 5, 0);  // CRITICAL: Must be >= 5 for FreeRTOS
 
-    SystemLog_Add(LOG_INFO, "main", "System startup complete");
+  HAL_UART_Transmit(&huart4, (uint8_t*)"System Starting...\r\n", 20, 1000);
 
-    /* Main System Loop -------------------------------------------------------*/
-    uint32_t last_sensor_update = 0;
-    uint32_t last_led_update = 0;
-    uint32_t last_tick = 0;
+  // Create FreeRTOS objects BEFORE starting scheduler
+  uartMutex = xSemaphoreCreateMutex();
+  i2cMutex = xSemaphoreCreateMutex();
 
-    while (1)
-    {
-        // Process user interface
-        TerminalUI_ProcessInput();
+  if (uartMutex == NULL || i2cMutex == NULL) {
+    HAL_UART_Transmit(&huart4, (uint8_t*)"Mutex creation failed\r\n", 23, 1000);
+    Error_Handler();
+  }
 
-        // Update LED timers every 100ms
-        if ((system_tick - last_led_update) >= LED_UPDATE_INTERVAL_MS) {
-            LED_UpdateTimers();
-            last_led_update = system_tick;
-        }
+  HAL_UART_Transmit(&huart4, (uint8_t*)"Mutexes created\r\n", 17, 1000);
 
-        // Update sensors every 5 seconds
-        if ((system_tick - last_sensor_update) >= SENSOR_UPDATE_INTERVAL_MS) {
-            Sensors_UpdateAll();
-            last_sensor_update = system_tick;
-        }
+  // Initialize basic modules (no I2C/UART dependencies)
+  LED_Init();
 
-        // Check for session timeout (if logged in)
-        if (TerminalUI_IsLoggedIn()) {
-            TerminalUI_CheckTimeout();
-        }
+  HAL_UART_Transmit(&huart4, (uint8_t*)"Modules initialized\r\n", 21, 1000);
 
-        // Update system tick (1ms resolution)
-        if (HAL_GetTick() != last_tick) {
-            last_tick = HAL_GetTick();
-            system_tick++;
-        }
-    }
+  // Initialize terminal UI LAST (sets up UART interrupt)
+  TerminalUI_Init();
+
+  HAL_UART_Transmit(&huart4, (uint8_t*)"Terminal UI ready\r\n", 19, 1000);
+
+  /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* Call init function for freertos objects (in cmsis_os2.c) */
+  MX_FREERTOS_Init();
+
+  HAL_UART_Transmit(&huart4, (uint8_t*)"Starting FreeRTOS...\r\n", 22, 1000);
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
 }
 
 /**
   * @brief System Clock Configuration
+  * @retval None
   */
 void SystemClock_Config(void)
 {
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    HAL_PWR_EnableBkUpAccess();
-    __HAL_RCC_PWR_CLK_ENABLE();
-    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
-    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLM = 4;
-    RCC_OscInitStruct.PLL.PLLN = 96;
-    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-    RCC_OscInitStruct.PLL.PLLQ = 4;
-    RCC_OscInitStruct.PLL.PLLR = 2;
+  /** Configure LSE Drive Capability */
+  HAL_PWR_EnableBkUpAccess();
 
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-    {
-        Error_Handler();
+  /** Configure the main internal regulator output voltage */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 96;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Activate the Over-Drive mode */
+  if (HAL_PWREx_EnableOverDrive() != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  // Mutexes already created in main()
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  // Create software timers
+  sensorTimer = xTimerCreate("SensorTimer",
+                            pdMS_TO_TICKS(5000),  // 5 second timer
+                            pdTRUE,  // Auto-reload
+                            (void*)0,
+                            SensorTimerCallback);
+
+  if (sensorTimer != NULL) {
+    xTimerStart(sensorTimer, 0);
+  }
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* USER CODE BEGIN RTOS_THREADS */
+
+  // Terminal Task - Highest priority for responsiveness
+  BaseType_t result1 = xTaskCreate(TerminalTask,
+                                  "TerminalTask",
+                                  TERMINAL_STACK_SIZE,
+                                  NULL,
+                                  TERMINAL_TASK_PRIORITY,
+                                  &terminalTaskHandle);
+
+  // Sensor Task - Normal priority
+  BaseType_t result2 = xTaskCreate(SensorTask,
+                                  "SensorTask",
+                                  SENSOR_STACK_SIZE,
+                                  NULL,
+                                  SENSOR_TASK_PRIORITY,
+                                  &sensorTaskHandle);
+
+  // LED Task - Normal priority
+  BaseType_t result3 = xTaskCreate(LEDTask,
+                                  "LEDTask",
+                                  LED_STACK_SIZE,
+                                  NULL,
+                                  LED_TASK_PRIORITY,
+                                  &ledTaskHandle);
+
+  // System monitoring task - Lower priority
+  BaseType_t result4 = xTaskCreate(SystemTask,
+                                  "SystemTask",
+                                  SYSTEM_STACK_SIZE,
+                                  NULL,
+                                  SYSTEM_TASK_PRIORITY,
+                                  &systemTaskHandle);
+
+  // Use direct UART instead of SystemLog during initialization
+  if (result1 != pdPASS || result2 != pdPASS ||
+      result3 != pdPASS || result4 != pdPASS) {
+    HAL_UART_Transmit(&huart4, (uint8_t*)"ERROR: Task creation failed\r\n", 29, 1000);
+  } else {
+    HAL_UART_Transmit(&huart4, (uint8_t*)"All tasks created successfully\r\n", 32, 1000);
+  }
+
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* USER CODE END RTOS_EVENTS */
+}
+
+// Task Implementations
+void TerminalTask(void *argument) {
+  // Add small delay to ensure system is stable
+  vTaskDelay(pdMS_TO_TICKS(100));
+
+  // Initialize modules that need FreeRTOS
+  SystemLog_Init();
+  PersistentLog_Init();  // Initialize persistent logging
+  Sensors_Init();
+
+  // Log system startup to persistent storage
+  SystemLog_AddPersistent(LOG_INFO, "system", "System started successfully");
+
+  // Now safe to use terminal functions with mutexes
+  TerminalUI_ShowBanner();
+
+  for(;;) {
+    TerminalUI_ProcessInput();
+    TerminalUI_CheckTimeout();
+    vTaskDelay(pdMS_TO_TICKS(10));  // 10ms polling
+  }
+}
+
+void SensorTask(void *argument) {
+  for(;;) {
+    // Wait for sensor timer notification
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
+
+    if (Sensors_UpdateAll()) {
+      SystemLog_Add(LOG_SENSOR, "sensors", "Data updated");
     }
 
-    if (HAL_PWREx_EnableOverDrive() != HAL_OK)
-    {
-        Error_Handler();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void LEDTask(void *argument) {
+  for(;;) {
+    LED_UpdateTimers();
+    vTaskDelay(pdMS_TO_TICKS(100));  // 100ms LED update
+  }
+}
+
+void SystemTask(void *argument) {
+  for(;;) {
+    // System monitoring - heap, stack, tasks
+    size_t freeHeap = xPortGetFreeHeapSize();
+    if (freeHeap < 1000) {
+      SystemLog_AddPersistent(LOG_WARNING, "system", "Low heap memory");
     }
 
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                                |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
-    {
-        Error_Handler();
+    // Check stack usage
+    if (terminalTaskHandle != NULL) {
+      UBaseType_t terminalStack = uxTaskGetStackHighWaterMark(terminalTaskHandle);
+      if (terminalStack < 50) {
+        SystemLog_AddPersistent(LOG_WARNING, "system", "Terminal task low stack");
+      }
     }
+
+    vTaskDelay(pdMS_TO_TICKS(10000));  // Check every 10 seconds
+  }
+}
+
+// Timer Callback
+void SensorTimerCallback(TimerHandle_t xTimer) {
+  // Notify sensor task to update
+  if (sensorTaskHandle != NULL) {
+    xTaskNotifyGive(sensorTaskHandle);
+  }
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+  /* USER CODE END Callback 1 */
 }
 
 /**
@@ -158,12 +408,16 @@ void SystemClock_Config(void)
   */
 void Error_Handler(void)
 {
-    __disable_irq();
-    SystemLog_Add(LOG_ERROR, "main", "System error - entering error handler");
-    while (1)
-    {
-        // Error state - could implement error recovery here
-    }
+  /* USER CODE BEGIN Error_Handler_Debug */
+  // Log critical error to persistent storage before halting
+  if (uartMutex != NULL) {
+    SystemLog_AddPersistent(LOG_ERROR, "system", "Critical error - system halted");
+  }
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
@@ -176,235 +430,7 @@ void Error_Handler(void)
   */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-    /* User can add his own implementation to report the file name and line number,
-       ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-    SystemLog_Add(LOG_ERROR, "assert", "Assertion failed");
+  /* USER CODE BEGIN 6 */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
-/* Additional UI Functions for Terminal Module Support */
-
-void TerminalUI_ShowSystemInfo(void) {
-    const ClimateData_t* climate = Sensors_GetClimate();
-    const AccelData_t* accel = Sensors_GetAccel();
-
-    TerminalUI_SendString(COLOR_INFO "System Information:\r\n" COLOR_RESET);
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-
-    // Multi-sensor status
-    TerminalUI_SendString(COLOR_MUTED " Multi-Sensor System:\r\n");
-
-    if (climate->sensor_ok) {
-        char msg[120];
-        sprintf(msg, COLOR_MUTED "   HDC1080:     " COLOR_SUCCESS "Online" COLOR_MUTED " (I2C2)\r\n");
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Temperature: " COLOR_PRIMARY "%.1f°C\r\n", climate->temperature);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Humidity:    " COLOR_PRIMARY "%.1f%% RH\r\n", climate->humidity);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Comfort:     %s\r\n", Sensors_GetComfortStatus());
-        TerminalUI_SendString(msg);
-    } else {
-        TerminalUI_SendString(COLOR_MUTED "   HDC1080:     " COLOR_ERROR "Offline/Error\r\n");
-    }
-
-    if (accel->sensor_ok) {
-        char msg[120];
-        sprintf(msg, COLOR_MUTED "   ADXL345:     " COLOR_SUCCESS "Online" COLOR_MUTED " (I2C2)\r\n");
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Accel:       " COLOR_PRIMARY "%.3fg total\r\n", accel->magnitude);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Tilt:        " COLOR_PRIMARY "X=%.1f°, Y=%.1f°\r\n", accel->tilt_x, accel->tilt_y);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Orient:      %s\r\n", Sensors_GetOrientationStatus());
-        TerminalUI_SendString(msg);
-    } else {
-        TerminalUI_SendString(COLOR_MUTED "   ADXL345:     " COLOR_ERROR "Offline/Error\r\n");
-    }
-
-    // System info
-    TerminalUI_SendString(COLOR_MUTED " MCU:           " COLOR_PRIMARY "STM32F767VIT6\r\n");
-    TerminalUI_SendString(COLOR_MUTED " Firmware:      " COLOR_PRIMARY SYSTEM_VERSION "\r\n");
-
-    char info_line[150];  // Increased buffer size
-    uint32_t seconds = system_tick / 1000;
-    uint32_t minutes = seconds / 60;
-    uint32_t hours = minutes / 60;
-    uint32_t days = hours / 24;
-
-    if (days > 0)
-        sprintf(info_line, COLOR_MUTED " Uptime:        " COLOR_PRIMARY "%lu days, %02lu:%02lu:%02lu\r\n", days, hours % 24, minutes % 60, seconds % 60);
-    else
-        sprintf(info_line, COLOR_MUTED " Uptime:        " COLOR_PRIMARY "%02lu:%02lu:%02lu\r\n", hours % 24, minutes % 60, seconds % 60);
-    TerminalUI_SendString(info_line);
-
-    sprintf(info_line, COLOR_MUTED " LEDs:          " COLOR_PRIMARY "1:%s 2:%s 3:%s\r\n",
-        LED_GetState(1) ? COLOR_SUCCESS "ON" COLOR_PRIMARY : COLOR_MUTED "OFF" COLOR_PRIMARY,
-        LED_GetState(2) ? COLOR_SUCCESS "ON" COLOR_PRIMARY : COLOR_MUTED "OFF" COLOR_PRIMARY,
-        LED_GetState(3) ? COLOR_SUCCESS "ON" COLOR_PRIMARY : COLOR_MUTED "OFF" COLOR_PRIMARY);
-    TerminalUI_SendString(info_line);
-
-    sprintf(info_line, COLOR_MUTED " Log entries:   " COLOR_PRIMARY "%d\r\n", SystemLog_GetCount());
-    TerminalUI_SendString(info_line);
-
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-}
-
-void TerminalUI_ShowUptime(void) {
-    TerminalUI_SendString(COLOR_INFO "System Uptime:\r\n" COLOR_RESET);
-
-    uint32_t seconds = system_tick / 1000;
-    uint32_t minutes = seconds / 60;
-    uint32_t hours = minutes / 60;
-    uint32_t days = hours / 24;
-
-    char uptime_msg[80];
-    if (days > 0)
-        sprintf(uptime_msg, COLOR_MUTED " Boot time: " COLOR_PRIMARY "%lu days, %02lu:%02lu:%02lu ago\r\n", days, hours % 24, minutes % 60, seconds % 60);
-    else
-        sprintf(uptime_msg, COLOR_MUTED " Boot time: " COLOR_PRIMARY "%02lu:%02lu:%02lu ago\r\n", hours % 24, minutes % 60, seconds % 60);
-    TerminalUI_SendString(uptime_msg);
-}
-
-void TerminalUI_ShowAllSensors(void) {
-    const ClimateData_t* climate = Sensors_GetClimate();
-    const AccelData_t* accel = Sensors_GetAccel();
-
-    TerminalUI_SendString(COLOR_INFO "All Sensors Status:\r\n" COLOR_RESET);
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-
-    // Climate sensor section
-    TerminalUI_SendString(COLOR_ACCENT "🌡️  Climate Sensor (HDC1080):\r\n" COLOR_RESET);
-    if (climate->sensor_ok) {
-        char msg[120];
-        sprintf(msg, COLOR_MUTED "   Temperature: " COLOR_PRIMARY "%.2f°C\r\n", climate->temperature);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Humidity:    " COLOR_PRIMARY "%.2f%% RH\r\n", climate->humidity);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Status:      %s\r\n", Sensors_GetComfortStatus());
-        TerminalUI_SendString(msg);
-    } else {
-        TerminalUI_SendString(COLOR_ERROR "   Status: Offline/Error\r\n" COLOR_RESET);
-    }
-
-    TerminalUI_SendString("\r\n");
-
-    // Accelerometer section
-    TerminalUI_SendString(COLOR_ACCENT "📐 Accelerometer (ADXL345):\r\n" COLOR_RESET);
-    if (accel->sensor_ok) {
-        char msg[120];
-        sprintf(msg, COLOR_MUTED "   X-axis:      " COLOR_PRIMARY "%.3fg (%.1f°)\r\n", accel->x_g, accel->tilt_x);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Y-axis:      " COLOR_PRIMARY "%.3fg (%.1f°)\r\n", accel->y_g, accel->tilt_y);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Z-axis:      " COLOR_PRIMARY "%.3fg\r\n", accel->z_g);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Magnitude:   " COLOR_PRIMARY "%.3fg\r\n", accel->magnitude);
-        TerminalUI_SendString(msg);
-        sprintf(msg, COLOR_MUTED "   Orientation: %s\r\n", Sensors_GetOrientationStatus());
-        TerminalUI_SendString(msg);
-    } else {
-        TerminalUI_SendString(COLOR_ERROR "   Status: Offline/Error\r\n" COLOR_RESET);
-    }
-
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-}
-
-void TerminalUI_ShowDetailedAccel(void) {
-    const AccelData_t* accel = Sensors_GetAccel();
-
-    TerminalUI_SendString(COLOR_INFO "Detailed Accelerometer Data:\r\n" COLOR_RESET);
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-
-    if (!accel->sensor_ok) {
-        TerminalUI_SendString(COLOR_ERROR "Accelerometer offline or error\r\n");
-        TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-        return;
-    }
-
-    // Force fresh reading
-    Sensors_UpdateAccel();
-    accel = Sensors_GetAccel();
-
-    char msg[150];
-
-    TerminalUI_SendString(COLOR_ACCENT "📊 Raw Data:\r\n" COLOR_RESET);
-    sprintf(msg, COLOR_MUTED "   X-axis: " COLOR_PRIMARY "%d LSB" COLOR_MUTED " → " COLOR_PRIMARY "%.3fg\r\n", accel->x_raw, accel->x_g);
-    TerminalUI_SendString(msg);
-    sprintf(msg, COLOR_MUTED "   Y-axis: " COLOR_PRIMARY "%d LSB" COLOR_MUTED " → " COLOR_PRIMARY "%.3fg\r\n", accel->y_raw, accel->y_g);
-    TerminalUI_SendString(msg);
-    sprintf(msg, COLOR_MUTED "   Z-axis: " COLOR_PRIMARY "%d LSB" COLOR_MUTED " → " COLOR_PRIMARY "%.3fg\r\n", accel->z_raw, accel->z_g);
-    TerminalUI_SendString(msg);
-
-    TerminalUI_SendString("\r\n" COLOR_ACCENT "📐 Orientation Analysis:\r\n" COLOR_RESET);
-    sprintf(msg, COLOR_MUTED "   X-Tilt:    " COLOR_PRIMARY "%.1f°\r\n", accel->tilt_x);
-    TerminalUI_SendString(msg);
-    sprintf(msg, COLOR_MUTED "   Y-Tilt:    " COLOR_PRIMARY "%.1f°\r\n", accel->tilt_y);
-    TerminalUI_SendString(msg);
-    sprintf(msg, COLOR_MUTED "   Magnitude: " COLOR_PRIMARY "%.3fg\r\n", accel->magnitude);
-    TerminalUI_SendString(msg);
-    sprintf(msg, COLOR_MUTED "   Status:    %s\r\n", Sensors_GetOrientationStatus());
-    TerminalUI_SendString(msg);
-
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-}
-
-void TerminalUI_I2CScan(void) {
-    TerminalUI_SendString(COLOR_INFO "Scanning I2C2 bus...\r\n" COLOR_RESET);
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-    uint8_t devices_found = 0;
-
-    for (uint8_t address = 1; address < 128; address++) {
-        HAL_StatusTypeDef status = HAL_I2C_IsDeviceReady(&hi2c2, address << 1, 1, 100);
-        if (status == HAL_OK) {
-            char msg[70];
-            sprintf(msg, COLOR_SUCCESS " Device found at 0x%02X", address);
-            TerminalUI_SendString(msg);
-
-            if (address == 0x40) TerminalUI_SendString(" (HDC1080 Temperature/Humidity)");
-            else if (address == 0x53) TerminalUI_SendString(" (ADXL345 Accelerometer)");
-            else if (address == 0x68) TerminalUI_SendString(" (MPU6050 or DS1307)");
-            else if (address == 0x77) TerminalUI_SendString(" (BMP280/BME280)");
-
-            TerminalUI_SendString(COLOR_RESET "\r\n");
-            devices_found++;
-        }
-    }
-
-    if (devices_found == 0) {
-        TerminalUI_SendString(COLOR_ERROR " No I2C devices found!\r\n" COLOR_RESET);
-    } else {
-        char msg[50];
-        sprintf(msg, COLOR_INFO " Total devices found: %d\r\n" COLOR_RESET, devices_found);
-        TerminalUI_SendString(msg);
-    }
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-}
-
-void TerminalUI_I2CTest(void) {
-    TerminalUI_SendString(COLOR_INFO "I2C2 Configuration Test:\r\n" COLOR_RESET);
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-
-    if (__HAL_RCC_I2C2_IS_CLK_ENABLED()) {
-        TerminalUI_SendString(COLOR_SUCCESS " ✓ I2C2 Clock: Enabled\r\n" COLOR_RESET);
-    } else {
-        TerminalUI_SendString(COLOR_ERROR " ✗ I2C2 Clock: DISABLED!\r\n" COLOR_RESET);
-    }
-
-    if (__HAL_RCC_GPIOF_IS_CLK_ENABLED()) {
-        TerminalUI_SendString(COLOR_SUCCESS " ✓ GPIOF Clock: Enabled\r\n" COLOR_RESET);
-    } else {
-        TerminalUI_SendString(COLOR_ERROR " ✗ GPIOF Clock: DISABLED!\r\n" COLOR_RESET);
-    }
-
-    TerminalUI_SendString(COLOR_INFO " Testing I2C2 basic operation...\r\n" COLOR_RESET);
-    HAL_StatusTypeDef status = HAL_I2C_IsDeviceReady(&hi2c2, 0x00, 1, 100);
-
-    if (status == HAL_ERROR || status == HAL_TIMEOUT) {
-        TerminalUI_SendString(COLOR_SUCCESS " ✓ I2C2 peripheral: Working\r\n" COLOR_RESET);
-    } else {
-        TerminalUI_SendString(COLOR_WARNING " ⚠ I2C2 peripheral: Unexpected response\r\n" COLOR_RESET);
-    }
-
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
-}

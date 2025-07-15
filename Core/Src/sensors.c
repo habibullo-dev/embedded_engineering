@@ -1,10 +1,14 @@
-/* sensors.c - Multi-Sensor Management Implementation */
 #include "sensors.h"
 #include "system_logging.h"
 #include "system_config.h"
-#include "terminal_ui.h"  // Add this include for TerminalUI_SendString
+#include "terminal_ui.h"
+#include "freertos_globals.h"  // For global FreeRTOS objects
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
 #include <stdio.h>
 #include <math.h>
+#include <string.h>  // Add missing include for strlen
 
 // Private sensor data
 static ClimateData_t climate_data = {0.0f, 0.0f, 0, 0};
@@ -12,7 +16,7 @@ static AccelData_t accel_data = {0, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0,
 
 // External references
 extern I2C_HandleTypeDef hi2c2;
-extern volatile uint32_t system_tick;
+extern UART_HandleTypeDef huart4;      // Add missing extern for UART
 
 // Private constants
 #define HDC1080_ADDRESS     0x40 << 1
@@ -29,6 +33,9 @@ extern volatile uint32_t system_tick;
 #define ADXL345_MEASURE_MODE 0x08
 #define ADXL345_RANGE_2G    0x00
 
+// Sensor access timeout for FreeRTOS
+#define SENSOR_TIMEOUT_MS   200
+
 // Private function declarations
 static uint8_t hdc1080_init(void);
 static uint8_t adxl345_init(void);
@@ -36,10 +43,24 @@ static uint8_t hdc1080_read_data(void);
 static uint8_t adxl345_read_data(void);
 static float calculate_tilt_angle(float accel_axis, float accel_z);
 
+// Thread-safe sensor data access
+static void update_climate_timestamp(void);
+static void update_accel_timestamp(void);
+
 // Public function implementations
 uint8_t Sensors_Init(void) {
-    uint8_t climate_ok = hdc1080_init();
-    uint8_t accel_ok = adxl345_init();
+    uint8_t climate_ok = 0;
+    uint8_t accel_ok = 0;
+
+    // Initialize with I2C mutex protection
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(SENSOR_TIMEOUT_MS)) == pdTRUE) {
+        climate_ok = hdc1080_init();
+        accel_ok = adxl345_init();
+        xSemaphoreGive(i2cMutex);
+    } else {
+        SystemLog_Add(LOG_ERROR, "sensors", "I2C mutex timeout during init");
+        return 0;
+    }
 
     if (climate_ok) {
         SystemLog_Add(LOG_SUCCESS, "sensors", "HDC1080 initialized");
@@ -65,19 +86,39 @@ uint8_t Sensors_UpdateAll(void) {
 }
 
 uint8_t Sensors_UpdateClimate(void) {
-    if (hdc1080_read_data()) {
-        climate_data.last_update = system_tick;
-        return 1;
+    uint8_t result = 0;
+
+    // Thread-safe I2C access
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(SENSOR_TIMEOUT_MS)) == pdTRUE) {
+        result = hdc1080_read_data();
+        if (result) {
+            update_climate_timestamp();
+        }
+        xSemaphoreGive(i2cMutex);
+    } else {
+        SystemLog_Add(LOG_WARNING, "sensors", "Climate update: I2C timeout");
+        climate_data.sensor_ok = 0;
     }
-    return 0;
+
+    return result;
 }
 
 uint8_t Sensors_UpdateAccel(void) {
-    if (adxl345_read_data()) {
-        accel_data.last_update = system_tick;
-        return 1;
+    uint8_t result = 0;
+
+    // Thread-safe I2C access
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(SENSOR_TIMEOUT_MS)) == pdTRUE) {
+        result = adxl345_read_data();
+        if (result) {
+            update_accel_timestamp();
+        }
+        xSemaphoreGive(i2cMutex);
+    } else {
+        SystemLog_Add(LOG_WARNING, "sensors", "Accel update: I2C timeout");
+        accel_data.sensor_ok = 0;
     }
-    return 0;
+
+    return result;
 }
 
 const ClimateData_t* Sensors_GetClimate(void) {
@@ -136,46 +177,88 @@ const char* Sensors_GetOrientationStatus(void) {
 }
 
 void Sensors_RunAllTests(void) {
-    TerminalUI_SendString(COLOR_INFO "=== Comprehensive Sensor Test ===\r\n" COLOR_RESET);
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
+    // Thread-safe terminal output for comprehensive sensor test
+    if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_INFO "=== Comprehensive Sensor Test ===\r\n" COLOR_RESET,
+                         strlen(COLOR_INFO "=== Comprehensive Sensor Test ===\r\n" COLOR_RESET), 1000);
+        HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET,
+                         strlen(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET), 1000);
+        xSemaphoreGive(uartMutex);
+    }
 
-    // Test HDC1080
-    TerminalUI_SendString(COLOR_ACCENT "Testing HDC1080 (Climate)...\r\n" COLOR_RESET);
-    if (hdc1080_read_data()) {
+    // Test HDC1080 with I2C protection
+    if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_ACCENT "Testing HDC1080 (Climate)...\r\n" COLOR_RESET,
+                         strlen(COLOR_ACCENT "Testing HDC1080 (Climate)...\r\n" COLOR_RESET), 1000);
+        xSemaphoreGive(uartMutex);
+    }
+
+    if (Sensors_UpdateClimate()) {
         char msg[100];
         sprintf(msg, COLOR_SUCCESS "✓ HDC1080: %.2f°C, %.2f%% RH\r\n" COLOR_RESET,
                climate_data.temperature, climate_data.humidity);
-        TerminalUI_SendString(msg);
+        if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            HAL_UART_Transmit(&huart4, (uint8_t*)msg, strlen(msg), 1000);
+            xSemaphoreGive(uartMutex);
+        }
     } else {
-        TerminalUI_SendString(COLOR_ERROR "✗ HDC1080: Communication failed\r\n" COLOR_RESET);
+        if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_ERROR "✗ HDC1080: Communication failed\r\n" COLOR_RESET,
+                             strlen(COLOR_ERROR "✗ HDC1080: Communication failed\r\n" COLOR_RESET), 1000);
+            xSemaphoreGive(uartMutex);
+        }
     }
 
-    TerminalUI_SendString("\r\n");
+    if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        HAL_UART_Transmit(&huart4, (uint8_t*)"\r\n", 2, 1000);
+        xSemaphoreGive(uartMutex);
+    }
 
-    // Test ADXL345
-    TerminalUI_SendString(COLOR_ACCENT "Testing ADXL345 (Accelerometer)...\r\n" COLOR_RESET);
-    if (adxl345_read_data()) {
+    // Test ADXL345 with I2C protection
+    if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_ACCENT "Testing ADXL345 (Accelerometer)...\r\n" COLOR_RESET,
+                         strlen(COLOR_ACCENT "Testing ADXL345 (Accelerometer)...\r\n" COLOR_RESET), 1000);
+        xSemaphoreGive(uartMutex);
+    }
+
+    if (Sensors_UpdateAccel()) {
         char msg[120];
         sprintf(msg, COLOR_SUCCESS "✓ ADXL345: X=%.3fg, Y=%.3fg, Z=%.3fg\r\n" COLOR_RESET,
                accel_data.x_g, accel_data.y_g, accel_data.z_g);
-        TerminalUI_SendString(msg);
+        if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            HAL_UART_Transmit(&huart4, (uint8_t*)msg, strlen(msg), 1000);
+            xSemaphoreGive(uartMutex);
+        }
     } else {
-        TerminalUI_SendString(COLOR_ERROR "✗ ADXL345: Communication failed\r\n" COLOR_RESET);
+        if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_ERROR "✗ ADXL345: Communication failed\r\n" COLOR_RESET,
+                             strlen(COLOR_ERROR "✗ ADXL345: Communication failed\r\n" COLOR_RESET), 1000);
+            xSemaphoreGive(uartMutex);
+        }
     }
 
-    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
+    // Final status
+    if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET,
+                         strlen(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET), 1000);
 
-    if (climate_data.sensor_ok && accel_data.sensor_ok) {
-        TerminalUI_SendString(COLOR_SUCCESS "🎉 ALL SENSORS OPERATIONAL!\r\n" COLOR_RESET);
-    } else if (climate_data.sensor_ok || accel_data.sensor_ok) {
-        TerminalUI_SendString(COLOR_WARNING "⚠ PARTIAL SENSOR FUNCTIONALITY\r\n" COLOR_RESET);
-    } else {
-        TerminalUI_SendString(COLOR_ERROR "❌ NO SENSORS RESPONDING\r\n" COLOR_RESET);
+        if (climate_data.sensor_ok && accel_data.sensor_ok) {
+            HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_SUCCESS "🎉 ALL SENSORS OPERATIONAL!\r\n" COLOR_RESET,
+                             strlen(COLOR_SUCCESS "🎉 ALL SENSORS OPERATIONAL!\r\n" COLOR_RESET), 1000);
+        } else if (climate_data.sensor_ok || accel_data.sensor_ok) {
+            HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_WARNING "⚠ PARTIAL SENSOR FUNCTIONALITY\r\n" COLOR_RESET,
+                             strlen(COLOR_WARNING "⚠ PARTIAL SENSOR FUNCTIONALITY\r\n" COLOR_RESET), 1000);
+        } else {
+            HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_ERROR "❌ NO SENSORS RESPONDING\r\n" COLOR_RESET,
+                             strlen(COLOR_ERROR "❌ NO SENSORS RESPONDING\r\n" COLOR_RESET), 1000);
+        }
+        xSemaphoreGive(uartMutex);
     }
 }
 
 // Private function implementations
 static uint8_t hdc1080_init(void) {
+    // This function assumes I2C mutex is already taken
     HAL_StatusTypeDef status;
     uint8_t config_data[2];
 
@@ -188,12 +271,13 @@ static uint8_t hdc1080_init(void) {
                               I2C_MEMADD_SIZE_8BIT, config_data, 2, 1000);
     if (status != HAL_OK) return 0;
 
-    HAL_Delay(15);
+    vTaskDelay(pdMS_TO_TICKS(15));  // Use FreeRTOS delay instead of HAL_Delay
     climate_data.sensor_ok = 1;
     return 1;
 }
 
 static uint8_t adxl345_init(void) {
+    // This function assumes I2C mutex is already taken
     HAL_StatusTypeDef status;
     uint8_t device_id, config_data;
 
@@ -214,16 +298,17 @@ static uint8_t adxl345_init(void) {
                               I2C_MEMADD_SIZE_8BIT, &config_data, 1, 1000);
     if (status != HAL_OK) return 0;
 
-    HAL_Delay(50);
+    vTaskDelay(pdMS_TO_TICKS(50));  // Use FreeRTOS delay instead of HAL_Delay
     accel_data.sensor_ok = 1;
     return 1;
 }
 
 static uint8_t hdc1080_read_data(void) {
-    // Use combined measurement method from working code
+    // This function assumes I2C mutex is already taken
+    // Reset I2C bus to ensure clean communication
     HAL_I2C_DeInit(&hi2c2);
     HAL_I2C_Init(&hi2c2);
-    HAL_Delay(5); // Short delay after bus reset
+    vTaskDelay(pdMS_TO_TICKS(5)); // Use FreeRTOS delay
 
     HAL_StatusTypeDef status;
     uint8_t measurement_data[4];  // 2 bytes temp + 2 bytes humidity
@@ -239,7 +324,7 @@ static uint8_t hdc1080_read_data(void) {
     }
 
     // Step 2: Wait for both conversions (temp + humidity = ~12.7ms total)
-    HAL_Delay(15);
+    vTaskDelay(pdMS_TO_TICKS(15));  // Use FreeRTOS delay
 
     // Step 3: Read all 4 bytes (temp MSB, temp LSB, humidity MSB, humidity LSB)
     status = HAL_I2C_Master_Receive(&hi2c2, HDC1080_ADDRESS, measurement_data, 4, 1000);
@@ -261,13 +346,17 @@ static uint8_t hdc1080_read_data(void) {
 }
 
 static uint8_t adxl345_read_data(void) {
+    // This function assumes I2C mutex is already taken
     HAL_StatusTypeDef status;
     uint8_t raw_data[6];
 
     status = HAL_I2C_Mem_Read(&hi2c2, ADXL345_ADDRESS, ADXL345_DATAX0,
                              I2C_MEMADD_SIZE_8BIT, raw_data, 6, 1000);
 
-    if (status != HAL_OK) { accel_data.sensor_ok = 0; return 0; }
+    if (status != HAL_OK) {
+        accel_data.sensor_ok = 0;
+        return 0;
+    }
 
     accel_data.x_raw = (int16_t)((raw_data[1] << 8) | raw_data[0]);
     accel_data.y_raw = (int16_t)((raw_data[3] << 8) | raw_data[2]);
@@ -300,5 +389,23 @@ static float calculate_tilt_angle(float accel_axis, float accel_z) {
         angle_deg = (angle_deg >= 0) ? (angle_deg - 180.0f) : (angle_deg + 180.0f);
     }
 
-    return angle_deg;  // This was missing - function needs to return the calculated angle
+    return angle_deg;
+}
+
+// Thread-safe timestamp updates
+static void update_climate_timestamp(void) {
+    climate_data.last_update = xTaskGetTickCount();
+}
+
+static void update_accel_timestamp(void) {
+    accel_data.last_update = xTaskGetTickCount();
+}
+
+// FreeRTOS-specific sensor monitoring functions
+void Sensors_LogStatus(void) {
+    char statusMsg[80];
+    sprintf(statusMsg, "Climate: %s, Accel: %s",
+           climate_data.sensor_ok ? "OK" : "ERROR",
+           accel_data.sensor_ok ? "OK" : "ERROR");
+    SystemLog_Add(LOG_SENSOR, "sensors", statusMsg);
 }

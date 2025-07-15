@@ -1,12 +1,17 @@
-/* terminal_ui.c - Terminal User Interface Implementation */
+/* terminal_ui.c - Terminal User Interface Implementation - FreeRTOS Version */
 #include "terminal_ui.h"
 #include "system_config.h"
 #include "system_logging.h"
 #include "sensors.h"
 #include "led_control.h"
+#include "freertos_globals.h"  // For global FreeRTOS objects
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "persistent_logging.h"
 
 // Private constants
 #define MAX_CMD_LENGTH 32
@@ -41,7 +46,6 @@ static volatile uint32_t last_activity = 0;
 // External references
 extern UART_HandleTypeDef huart4;
 extern I2C_HandleTypeDef hi2c2;
-extern volatile uint32_t system_tick;
 
 // Private function declarations
 static uint8_t buffer_has_data(void);
@@ -60,10 +64,18 @@ static void delete_char_at_cursor(void);
 static void redraw_from_cursor(void);
 static const char* format_uptime(uint32_t ms);
 
+// Thread-safe UART transmission helper
+static void safe_uart_transmit(const uint8_t* data, uint16_t size) {
+    if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        HAL_UART_Transmit(&huart4, data, size, 1000);
+        xSemaphoreGive(uartMutex);
+    }
+}
+
 // Public function implementations
 void TerminalUI_Init(void) {
     __HAL_UART_ENABLE_IT(&huart4, UART_IT_RXNE);
-    NVIC_SetPriority(UART4_IRQn, 0);
+    NVIC_SetPriority(UART4_IRQn, 5);  // FreeRTOS compatible priority
     NVIC_EnableIRQ(UART4_IRQn);
     HAL_UART_Receive_IT(&huart4, (uint8_t*)&rx_char, 1);
 
@@ -88,7 +100,7 @@ void TerminalUI_ShowBanner(void) {
     TerminalUI_SendString(COLOR_MUTED "╭─────────────────────────────────────────╮\r\n");
     TerminalUI_SendString("│ " COLOR_ACCENT "STM32F767" COLOR_MUTED " Professional Terminal         │\r\n");
     TerminalUI_SendString("│ " COLOR_INFO "Multi-Sensor" COLOR_MUTED " • " COLOR_SUCCESS "HDC1080" COLOR_MUTED " • " COLOR_WARNING "ADXL345" COLOR_MUTED "    │\r\n");
-    TerminalUI_SendString("│ " COLOR_SUCCESS "Secure Shell v2.1" COLOR_MUTED " with Diagnostics      │\r\n");
+    TerminalUI_SendString("│ " COLOR_SUCCESS "FreeRTOS v10.x" COLOR_MUTED " Multi-Threading       │\r\n");
     TerminalUI_SendString("╰─────────────────────────────────────────╯" COLOR_RESET "\r\n");
 
     // Show sensor status using global data
@@ -121,13 +133,19 @@ void TerminalUI_ShowPrompt(void) {
 }
 
 void TerminalUI_SendString(const char* str) {
-    HAL_UART_Transmit(&huart4, (uint8_t*)str, strlen(str), 1000);
+    if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        HAL_UART_Transmit(&huart4, (uint8_t*)str, strlen(str), 1000);
+        xSemaphoreGive(uartMutex);
+    }
 }
 
 void TerminalUI_PrintStatus(const char* message, const char* color) {
-    TerminalUI_SendString(color);
-    TerminalUI_SendString(message);
-    TerminalUI_SendString(COLOR_RESET "\r\n");
+    if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        HAL_UART_Transmit(&huart4, (uint8_t*)color, strlen(color), 1000);
+        HAL_UART_Transmit(&huart4, (uint8_t*)message, strlen(message), 1000);
+        HAL_UART_Transmit(&huart4, (uint8_t*)COLOR_RESET "\r\n", strlen(COLOR_RESET "\r\n"), 1000);
+        xSemaphoreGive(uartMutex);
+    }
 }
 
 void TerminalUI_ProcessCommand(void) {
@@ -148,7 +166,7 @@ void TerminalUI_ProcessCommand(void) {
             Sensors_UpdateAll();
             TerminalUI_ShowPrompt();
             current_state = 2;
-            last_activity = system_tick;
+            last_activity = xTaskGetTickCount();  // Use FreeRTOS tick count
             SystemLog_Add(LOG_LOGIN, "auth", "Authentication successful");
         } else {
             TerminalUI_PrintStatus("Access denied", COLOR_ERROR);
@@ -170,13 +188,25 @@ void TerminalUI_ProcessCommand(void) {
         else if (strcmp((char*)cmd_buffer, "history") == 0) {
             TerminalUI_SendString(COLOR_INFO "Command History:\r\n" COLOR_RESET);
             for (uint8_t i = 0; i < history_count; i++) {
-                char msg[80];  // Increased buffer size
+                char msg[80];
                 sprintf(msg, COLOR_MUTED " %d. " COLOR_PRIMARY "%s\r\n", i + 1, (char*)command_history[i]);
                 TerminalUI_SendString(msg);
             }
         }
         else if (strcmp((char*)cmd_buffer, "logs") == 0) {
             SystemLog_Display();
+        }
+
+        else if (strcmp((char*)cmd_buffer, "pflogs") == 0) {
+            PersistentLog_Display();
+        }
+        else if (strcmp((char*)cmd_buffer, "pclear") == 0) {
+            PersistentLog_EraseAll();
+            TerminalUI_PrintStatus("Persistent logs cleared", COLOR_SUCCESS);
+        }
+        else if (strcmp((char*)cmd_buffer, "ptest") == 0) {
+            SystemLog_AddPersistent(LOG_ERROR, "test", "Manual test log");
+            TerminalUI_PrintStatus("Test persistent log added", COLOR_SUCCESS);
         }
         else if (strcmp((char*)cmd_buffer, "status") == 0) {
             TerminalUI_ShowSystemInfo();
@@ -216,50 +246,34 @@ void TerminalUI_ProcessCommand(void) {
             TerminalUI_I2CTest();
         }
         else if (strcmp((char*)cmd_buffer, "sensortest") == 0) {
-            // Comprehensive sensor test
-            TerminalUI_SendString(COLOR_INFO "=== Comprehensive Sensor Test ===\r\n" COLOR_RESET);
+            Sensors_RunAllTests();
+        }
+        else if (strcmp((char*)cmd_buffer, "tasks") == 0) {
+            // FreeRTOS task monitoring
+            TerminalUI_SendString(COLOR_INFO "FreeRTOS Task Information:\r\n" COLOR_RESET);
             TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
 
-            const ClimateData_t* climate = Sensors_GetClimate();
-            const AccelData_t* accel = Sensors_GetAccel();
-
-            // Test HDC1080
-            TerminalUI_SendString(COLOR_ACCENT "Testing HDC1080 (Climate)...\r\n" COLOR_RESET);
-            Sensors_UpdateClimate();
-            climate = Sensors_GetClimate();
-            if (climate->sensor_ok) {
-                char msg[100];
-                sprintf(msg, COLOR_SUCCESS "✓ HDC1080: %.2f°C, %.2f%% RH\r\n" COLOR_RESET,
-                       climate->temperature, climate->humidity);
-                TerminalUI_SendString(msg);
-            } else {
-                TerminalUI_SendString(COLOR_ERROR "✗ HDC1080: Communication failed\r\n" COLOR_RESET);
-            }
-
-            TerminalUI_SendString("\r\n");
-
-            // Test ADXL345
-            TerminalUI_SendString(COLOR_ACCENT "Testing ADXL345 (Accelerometer)...\r\n" COLOR_RESET);
-            Sensors_UpdateAccel();
-            accel = Sensors_GetAccel();
-            if (accel->sensor_ok) {
-                char msg[120];
-                sprintf(msg, COLOR_SUCCESS "✓ ADXL345: X=%.3fg, Y=%.3fg, Z=%.3fg\r\n" COLOR_RESET,
-                       accel->x_g, accel->y_g, accel->z_g);
-                TerminalUI_SendString(msg);
-            } else {
-                TerminalUI_SendString(COLOR_ERROR "✗ ADXL345: Communication failed\r\n" COLOR_RESET);
-            }
+            char taskList[512];
+            TerminalUI_SendString(COLOR_MUTED "Task Name       State  Prio  Stack  Num\r\n" COLOR_RESET);
+            vTaskList(taskList);
+            TerminalUI_SendString(taskList);
 
             TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
 
-            if (climate->sensor_ok && accel->sensor_ok) {
-                TerminalUI_SendString(COLOR_SUCCESS "🎉 ALL SENSORS OPERATIONAL!\r\n" COLOR_RESET);
-            } else if (climate->sensor_ok || accel->sensor_ok) {
-                TerminalUI_SendString(COLOR_WARNING "⚠ PARTIAL SENSOR FUNCTIONALITY\r\n" COLOR_RESET);
-            } else {
-                TerminalUI_SendString(COLOR_ERROR "❌ NO SENSORS RESPONDING\r\n" COLOR_RESET);
-            }
+            // Show heap info
+            size_t freeHeap = xPortGetFreeHeapSize();
+            size_t minFreeHeap = xPortGetMinimumEverFreeHeapSize();
+            char heapMsg[120];
+            sprintf(heapMsg, COLOR_MUTED " Free Heap: " COLOR_PRIMARY "%d bytes" COLOR_MUTED " (Min: " COLOR_PRIMARY "%d" COLOR_MUTED ")\r\n",
+                   freeHeap, minFreeHeap);
+            TerminalUI_SendString(heapMsg);
+        }
+        else if (strcmp((char*)cmd_buffer, "stack") == 0) {
+            // Show stack usage for current task
+            UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+            char stackMsg[60];
+            sprintf(stackMsg, COLOR_INFO "Current task stack remaining: " COLOR_PRIMARY "%lu words\r\n", (unsigned long)uxHighWaterMark);
+            TerminalUI_SendString(stackMsg);
         }
         else if (strcmp((char*)cmd_buffer, "help") == 0) {
             TerminalUI_ShowHelp();
@@ -291,7 +305,7 @@ uint8_t TerminalUI_IsLoggedIn(void) {
 
 void TerminalUI_Logout(void) {
     TerminalUI_PrintStatus("Goodbye!", COLOR_WARNING);
-    HAL_Delay(300);
+    vTaskDelay(pdMS_TO_TICKS(300));  // Use FreeRTOS delay
     current_state = 0;
     last_activity = 0;
     SystemLog_Add(LOG_LOGIN, "auth", "User logged out");
@@ -300,7 +314,8 @@ void TerminalUI_Logout(void) {
 
 void TerminalUI_CheckTimeout(void) {
     if (current_state == 2 && last_activity > 0) {
-        if ((system_tick - last_activity) > SESSION_TIMEOUT_MS) {
+        TickType_t currentTick = xTaskGetTickCount();
+        if ((currentTick - last_activity) > pdMS_TO_TICKS(SESSION_TIMEOUT_MS)) {
             TerminalUI_PrintStatus("Session timeout - automatically logged out", COLOR_WARNING);
             current_state = 0;
             last_activity = 0;
@@ -322,6 +337,9 @@ void TerminalUI_ShowHelp(void) {
     TerminalUI_SendString("\r\n" COLOR_MUTED " " COLOR_ACCENT "System Information:" COLOR_RESET "\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "status" COLOR_MUTED "           Show comprehensive system status\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "uptime" COLOR_MUTED "           Show system uptime\r\n");
+    TerminalUI_SendString("\r\n" COLOR_MUTED " " COLOR_ACCENT "FreeRTOS Commands:" COLOR_RESET "\r\n");
+    TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "tasks" COLOR_MUTED "            Show FreeRTOS tasks and heap\r\n");
+    TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "stack" COLOR_MUTED "            Show current task stack usage\r\n");
     TerminalUI_SendString("\r\n" COLOR_MUTED " " COLOR_ACCENT "LED Control:" COLOR_RESET "\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "led on|off N" COLOR_MUTED "     Control LED N (1-3)\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "led on|off all" COLOR_MUTED "   Control all LEDs\r\n");
@@ -405,7 +423,7 @@ static void process_character(char c) {
         if (cmd_index < MAX_CMD_LENGTH) {
             insert_char_at_cursor(c);
             current_history_pos = -1;
-            last_activity = system_tick;
+            last_activity = xTaskGetTickCount();  // Use FreeRTOS tick count
         } else {
             TerminalUI_SendString(COLOR_ERROR "!" COLOR_RESET);
         }
@@ -424,7 +442,7 @@ static void parse_led_command(char* cmd) {
 
         if (is_on && timer_duration > 0) {
             for (uint8_t i = 1; i <= 3; i++) {
-                LED_SetTimer(i, timer_duration);  // FIX: Remove - system_tick
+                LED_SetTimer(i, timer_duration);
             }
         }
     } else {
@@ -440,7 +458,7 @@ static void parse_led_command(char* cmd) {
             TerminalUI_PrintStatus(msg, COLOR_SUCCESS);
 
             if (is_on && timer_duration > 0) {
-                LED_SetTimer(led_num, timer_duration);  // FIX: Remove - system_tick
+                LED_SetTimer(led_num, timer_duration);
             }
         } else {
             TerminalUI_PrintStatus("Invalid LED number (1-3)", COLOR_ERROR);
@@ -456,6 +474,7 @@ static uint32_t parse_time_attribute(char* cmd) {
     return 0;
 }
 
+static const char* format_uptime(uint32_t ms) __attribute__((unused));  // Mark as unused to suppress warning
 static const char* format_uptime(uint32_t ms) {
     static char uptime_str[50];
     uint32_t seconds = ms / 1000;
@@ -520,14 +539,19 @@ static void show_history_command(int8_t direction) {
 }
 
 static void clear_current_line(void) {
-    TerminalUI_SendString("\r\033[K");
-    TerminalUI_ShowPrompt();
+    TerminalUI_SendString("\033[K");  // Clear from cursor to end, no \r
 }
 
 static void redraw_command_line(void) {
-    for (uint8_t i = 0; i < cmd_index; i++) {
-        HAL_UART_Transmit(&huart4, (uint8_t*)&cmd_buffer[i], 1, 100);
+    TerminalUI_SendString("\033[2K\r");  // Clear entire line, then move to start
+    if (current_state == 2) {
+        TerminalUI_SendString(COLOR_PROMPT "root" COLOR_MUTED "@" COLOR_PROMPT "stm32" COLOR_MUTED ":" COLOR_ACCENT "~" COLOR_MUTED "$ " COLOR_RESET);
     }
+
+    for (uint8_t i = 0; i < cmd_index; i++) {
+        safe_uart_transmit((uint8_t*)&cmd_buffer[i], 1);
+    }
+
     if (cursor_pos < cmd_index) {
         char move_cmd[10];
         sprintf(move_cmd, "\033[%dD", cmd_index - cursor_pos);
@@ -567,7 +591,7 @@ static void insert_char_at_cursor(char c) {
     cmd_index++;
     cursor_pos++;
     cmd_buffer[cmd_index] = '\0';
-    HAL_UART_Transmit(&huart4, (uint8_t*)&c, 1, 100);
+    safe_uart_transmit((uint8_t*)&c, 1);
     if (cursor_pos < cmd_index) {
         redraw_from_cursor();
     }
@@ -588,7 +612,7 @@ static void delete_char_at_cursor(void) {
 static void redraw_from_cursor(void) {
     TerminalUI_SendString("\033[K");
     for (uint8_t i = cursor_pos; i < cmd_index; i++) {
-        HAL_UART_Transmit(&huart4, (uint8_t*)&cmd_buffer[i], 1, 100);
+        safe_uart_transmit((uint8_t*)&cmd_buffer[i], 1);
     }
     if (cursor_pos < cmd_index) {
         char move_cmd[10];

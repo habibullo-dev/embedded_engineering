@@ -3,7 +3,7 @@
   ******************************************************************************
   * @file    usart.c
   * @brief   This file provides code for the configuration
-  *          of the USART instances.
+  *          of the USART instances - FreeRTOS Version
   ******************************************************************************
   * @attention
   *
@@ -125,7 +125,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
     /* UART4 interrupt Init */
-    HAL_NVIC_SetPriority(UART4_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(UART4_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(UART4_IRQn);
   /* USER CODE BEGIN UART4_MspInit 1 */
 
@@ -211,5 +211,42 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 }
 
 /* USER CODE BEGIN 1 */
+
+/* FreeRTOS Integration Notes:
+ *
+ * CRITICAL CHANGES FOR FREERTOS:
+ * ==============================
+ *
+ * 1. UART4 Interrupt Priority:
+ *    - Changed from priority 0 to 5
+ *    - This ensures the interrupt can safely call FreeRTOS API functions
+ *    - Priority must be >= configMAX_SYSCALL_INTERRUPT_PRIORITY (5)
+ *
+ * 2. Interrupt Priority Explanation:
+ *    - FreeRTOS uses interrupt priorities to protect critical sections
+ *    - Interrupts with priority 0-4 cannot call FreeRTOS API functions
+ *    - Interrupts with priority 5-15 can call FreeRTOS FromISR functions
+ *
+ * 3. What this means for your UART:
+ *    - HAL_UART_RxCpltCallback can now safely access FreeRTOS objects
+ *    - The terminal input buffer can be managed thread-safely
+ *    - No risk of corrupting FreeRTOS internal structures
+ *
+ * 4. If you see these symptoms, check interrupt priorities:
+ *    - System hangs or resets randomly
+ *    - HardFault exceptions
+ *    - Assertion failures in debug builds
+ *    - configASSERT failures
+ *
+ * 5. Priority Guidelines:
+ *    - 0-4: High priority, cannot use FreeRTOS APIs
+ *    - 5-15: Lower priority, can use FreeRTOS FromISR APIs
+ *    - 15: Lowest priority (idle level)
+ *
+ * 6. For other peripherals that need FreeRTOS integration:
+ *    - Set their interrupt priorities to 5 or higher
+ *    - Use FromISR versions of FreeRTOS API functions
+ *    - Always check return values from ISR API calls
+ */
 
 /* USER CODE END 1 */

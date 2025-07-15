@@ -1,15 +1,17 @@
-/* sensors.h - Multi-Sensor Management Interface */
+/* sensors.h - Multi-Sensor Management Interface - FreeRTOS Version */
 #ifndef SENSORS_H
 #define SENSORS_H
 
 #include "main.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 // Sensor data structures
 typedef struct {
-    float temperature;     // Temperature in Celsius
-    float humidity;        // Relative humidity in percentage
-    uint8_t sensor_ok;     // Sensor status flag
-    uint32_t last_update;  // Timestamp of last successful reading
+    float temperature;          // Temperature in Celsius
+    float humidity;             // Relative humidity in percentage
+    uint8_t sensor_ok;          // Sensor status flag
+    TickType_t last_update;     // FreeRTOS timestamp of last successful reading
 } ClimateData_t;
 
 typedef struct {
@@ -18,7 +20,7 @@ typedef struct {
     float magnitude;                // Total acceleration magnitude
     float tilt_x, tilt_y;          // Tilt angles in degrees
     uint8_t sensor_ok;              // Sensor status flag
-    uint32_t last_update;           // Timestamp of last successful reading
+    TickType_t last_update;         // FreeRTOS timestamp of last successful reading
 } AccelData_t;
 
 // Public function declarations
@@ -37,6 +39,9 @@ const char* Sensors_GetComfortStatus(void);
 const char* Sensors_GetOrientationStatus(void);
 
 // Test functions
-void Sensors_RunAllTests(void);  // Add this declaration
+void Sensors_RunAllTests(void);
+
+// FreeRTOS-specific sensor functions
+void Sensors_LogStatus(void);
 
 #endif /* SENSORS_H */
