@@ -126,28 +126,20 @@ int main(void)
   // Verify UART4 interrupt priority is FreeRTOS compatible
   HAL_NVIC_SetPriority(UART4_IRQn, 5, 0);  // CRITICAL: Must be >= 5 for FreeRTOS
 
-  HAL_UART_Transmit(&huart4, (uint8_t*)"System Starting...\r\n", 20, 1000);
-
   // Create FreeRTOS objects BEFORE starting scheduler
   uartMutex = xSemaphoreCreateMutex();
   i2cMutex = xSemaphoreCreateMutex();
 
   if (uartMutex == NULL || i2cMutex == NULL) {
-    HAL_UART_Transmit(&huart4, (uint8_t*)"Mutex creation failed\r\n", 23, 1000);
+    HAL_UART_Transmit(&huart4, (uint8_t*)"FATAL: Mutex creation failed\r\n", 30, 1000);
     Error_Handler();
   }
 
-  HAL_UART_Transmit(&huart4, (uint8_t*)"Mutexes created\r\n", 17, 1000);
-
-  // Initialize basic modules (no I2C/UART dependencies)
+  // Initialize basic modules
   LED_Init();
 
-  HAL_UART_Transmit(&huart4, (uint8_t*)"Modules initialized\r\n", 21, 1000);
-
-  // Initialize terminal UI LAST (sets up UART interrupt)
+  // Initialize terminal UI (sets up UART interrupt)
   TerminalUI_Init();
-
-  HAL_UART_Transmit(&huart4, (uint8_t*)"Terminal UI ready\r\n", 19, 1000);
 
   /* USER CODE END 2 */
 
@@ -156,8 +148,6 @@ int main(void)
 
   /* Call init function for freertos objects (in cmsis_os2.c) */
   MX_FREERTOS_Init();
-
-  HAL_UART_Transmit(&huart4, (uint8_t*)"Starting FreeRTOS...\r\n", 22, 1000);
 
   /* Start scheduler */
   osKernelStart();
@@ -298,9 +288,7 @@ void MX_FREERTOS_Init(void) {
   // Use direct UART instead of SystemLog during initialization
   if (result1 != pdPASS || result2 != pdPASS ||
       result3 != pdPASS || result4 != pdPASS) {
-    HAL_UART_Transmit(&huart4, (uint8_t*)"ERROR: Task creation failed\r\n", 29, 1000);
-  } else {
-    HAL_UART_Transmit(&huart4, (uint8_t*)"All tasks created successfully\r\n", 32, 1000);
+    HAL_UART_Transmit(&huart4, (uint8_t*)"FATAL: Task creation failed\r\n", 29, 1000);
   }
 
   /* USER CODE END RTOS_THREADS */
@@ -320,7 +308,7 @@ void TerminalTask(void *argument) {
   Sensors_Init();
 
   // Log system startup to persistent storage
-  SystemLog_AddPersistent(LOG_INFO, "system", "System started successfully");
+  PersistentLog_Add(LOG_INFO, "system", "System started successfully");
 
   // Now safe to use terminal functions with mutexes
   TerminalUI_ShowBanner();
@@ -333,12 +321,18 @@ void TerminalTask(void *argument) {
 }
 
 void SensorTask(void *argument) {
+  static uint32_t log_counter = 0;
   for(;;) {
     // Wait for sensor timer notification
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
 
     if (Sensors_UpdateAll()) {
-      SystemLog_Add(LOG_SENSOR, "sensors", "Data updated");
+      // Only log every 10th sensor update to save flash space
+      log_counter++;
+      if (log_counter >= 10) {
+        PersistentLog_Add(LOG_SENSOR, "sensors", "Periodic sensor update");
+        log_counter = 0;
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -357,14 +351,14 @@ void SystemTask(void *argument) {
     // System monitoring - heap, stack, tasks
     size_t freeHeap = xPortGetFreeHeapSize();
     if (freeHeap < 1000) {
-      SystemLog_AddPersistent(LOG_WARNING, "system", "Low heap memory");
+      PersistentLog_Add(LOG_WARNING, "system", "Low heap memory");
     }
 
     // Check stack usage
     if (terminalTaskHandle != NULL) {
       UBaseType_t terminalStack = uxTaskGetStackHighWaterMark(terminalTaskHandle);
       if (terminalStack < 50) {
-        SystemLog_AddPersistent(LOG_WARNING, "system", "Terminal task low stack");
+        PersistentLog_Add(LOG_WARNING, "system", "Terminal task low stack");
       }
     }
 
@@ -411,7 +405,7 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   // Log critical error to persistent storage before halting
   if (uartMutex != NULL) {
-    SystemLog_AddPersistent(LOG_ERROR, "system", "Critical error - system halted");
+    PersistentLog_Add(LOG_ERROR, "system", "Critical error - system halted");
   }
   __disable_irq();
   while (1)

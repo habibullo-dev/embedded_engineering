@@ -1,6 +1,6 @@
 /* led_control.c - LED Control Module Implementation - FreeRTOS Version */
 #include "led_control.h"
-#include "system_logging.h"
+#include "persistent_logging.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <stdio.h>
@@ -29,7 +29,7 @@ static uint16_t get_led_pin(uint8_t led_num) {
 // Public function implementations
 void LED_Init(void) {
     LED_ControlAll(LED_OFF);
-    SystemLog_Add(LOG_INFO, "led", "LED control initialized (FreeRTOS)");
+    PersistentLog_Add(LOG_INFO, "led", "LED control initialized (FreeRTOS)");
 }
 
 void LED_Control(uint8_t led_num, uint8_t state) {
@@ -67,7 +67,7 @@ void LED_SetTimer(uint8_t led_num, uint32_t duration_ms) {
 
     char msg[60];
     sprintf(msg, "LED%d timer set for %lums", led_num, duration_ms);
-    SystemLog_Add(LOG_INFO, "led", msg);
+    PersistentLog_Add(LOG_INFO, "led", msg);
 }
 
 void LED_UpdateTimers(void) {
@@ -82,7 +82,7 @@ void LED_UpdateTimers(void) {
                 LED_Control(i + 1, LED_OFF);
                 char msg[50];
                 sprintf(msg, "LED%d timer expired", i + 1);
-                SystemLog_Add(LOG_INFO, "led", msg);
+                PersistentLog_Add(LOG_INFO, "led", msg);
                 led_timers[i] = 0;  // Clear the timer
             }
         }

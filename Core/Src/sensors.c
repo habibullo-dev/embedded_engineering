@@ -1,5 +1,5 @@
 #include "sensors.h"
-#include "system_logging.h"
+#include "persistent_logging.h"
 #include "system_config.h"
 #include "terminal_ui.h"
 #include "freertos_globals.h"  // For global FreeRTOS objects
@@ -58,22 +58,22 @@ uint8_t Sensors_Init(void) {
         accel_ok = adxl345_init();
         xSemaphoreGive(i2cMutex);
     } else {
-        SystemLog_Add(LOG_ERROR, "sensors", "I2C mutex timeout during init");
+        PersistentLog_Add(LOG_ERROR, "sensors", "I2C mutex timeout during init");
         return 0;
     }
 
     if (climate_ok) {
-        SystemLog_Add(LOG_SUCCESS, "sensors", "HDC1080 initialized");
+        PersistentLog_Add(LOG_SUCCESS, "sensors", "HDC1080 initialized");
         Sensors_UpdateClimate();
     } else {
-        SystemLog_Add(LOG_ERROR, "sensors", "HDC1080 init failed");
+        PersistentLog_Add(LOG_ERROR, "sensors", "HDC1080 init failed");
     }
 
     if (accel_ok) {
-        SystemLog_Add(LOG_SUCCESS, "sensors", "ADXL345 initialized");
+        PersistentLog_Add(LOG_SUCCESS, "sensors", "ADXL345 initialized");
         Sensors_UpdateAccel();
     } else {
-        SystemLog_Add(LOG_ERROR, "sensors", "ADXL345 init failed");
+        PersistentLog_Add(LOG_ERROR, "sensors", "ADXL345 init failed");
     }
 
     return (climate_ok || accel_ok);
@@ -96,7 +96,7 @@ uint8_t Sensors_UpdateClimate(void) {
         }
         xSemaphoreGive(i2cMutex);
     } else {
-        SystemLog_Add(LOG_WARNING, "sensors", "Climate update: I2C timeout");
+        PersistentLog_Add(LOG_WARNING, "sensors", "Climate update: I2C timeout");
         climate_data.sensor_ok = 0;
     }
 
@@ -114,7 +114,7 @@ uint8_t Sensors_UpdateAccel(void) {
         }
         xSemaphoreGive(i2cMutex);
     } else {
-        SystemLog_Add(LOG_WARNING, "sensors", "Accel update: I2C timeout");
+        PersistentLog_Add(LOG_WARNING, "sensors", "Accel update: I2C timeout");
         accel_data.sensor_ok = 0;
     }
 
@@ -407,5 +407,5 @@ void Sensors_LogStatus(void) {
     sprintf(statusMsg, "Climate: %s, Accel: %s",
            climate_data.sensor_ok ? "OK" : "ERROR",
            accel_data.sensor_ok ? "OK" : "ERROR");
-    SystemLog_Add(LOG_SENSOR, "sensors", statusMsg);
+    // Sensor status updated - removed logging to prevent flash overflow
 }

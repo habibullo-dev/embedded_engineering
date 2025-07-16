@@ -1,4 +1,4 @@
-/* terminal_ui.c - Terminal User Interface Implementation - FreeRTOS Version */
+/* terminal_ui.c - Terminal User Interface with Interactive Logs */
 #include "terminal_ui.h"
 #include "system_config.h"
 #include "system_logging.h"
@@ -11,9 +11,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "persistent_logging.h"
 
-// Private constants
+// Configuration
 #define MAX_CMD_LENGTH 32
 #define RX_BUFFER_SIZE 64
 #define USERNAME "admin"
@@ -21,37 +22,56 @@
 #define HISTORY_SIZE 5
 #define SESSION_TIMEOUT_MS 300000
 
-// Private variables - UART
+// UART buffer management
 static volatile char rx_buffer[RX_BUFFER_SIZE];
 static volatile uint8_t rx_head = 0;
 static volatile uint8_t rx_tail = 0;
 static volatile uint8_t rx_char;
 
-// Private variables - Command processing
+// Command processing
 static volatile char cmd_buffer[MAX_CMD_LENGTH + 1];
 static volatile uint8_t cmd_index = 0;
 static volatile uint8_t cursor_pos = 0;
 static volatile uint8_t current_state = 0;  // 0=username, 1=password, 2=logged_in
 
-// Private variables - Command history
+// Logs mode state
+static volatile uint8_t logs_mode_active = 0;
+static volatile uint32_t current_log_page = 0;
+static volatile uint32_t total_log_pages = 0;
+
+// Command history
 static volatile char command_history[HISTORY_SIZE][MAX_CMD_LENGTH + 1];
 static volatile uint8_t history_count = 0;
 static volatile uint8_t history_index = 0;
 static volatile int8_t current_history_pos = -1;
 static volatile char temp_command[MAX_CMD_LENGTH + 1];
 
-// Private variables - Session management
+// Session management
 static volatile uint32_t last_activity = 0;
+
+// Command auto-completion and validation
+static const char* valid_commands[] = {
+    "help", "whoami", "clear", "history", "logout",
+    "logs", "clear-logs", "confirm-clear-logs",
+    "led", "status", "sensors", "uptime", "accel", "climate", 
+    "i2cscan", "sensortest", "tasks", 
+};
+static const uint8_t command_count = sizeof(valid_commands) / sizeof(valid_commands[0]);
 
 // External references
 extern UART_HandleTypeDef huart4;
 extern I2C_HandleTypeDef hi2c2;
 
-// Private function declarations
+// Function declarations
 static uint8_t buffer_has_data(void);
 static char get_char_from_buffer(void);
 static void process_character(char c);
 static void parse_led_command(char* cmd);
+static void display_logs_page(uint32_t page);
+static void show_logs_navigation(void);
+static void show_logs_help(void);
+static const char* get_level_color(LogLevel_t level);
+static const char* get_level_name(LogLevel_t level);
 static uint32_t parse_time_attribute(char* cmd);
 static void add_to_history(char* cmd);
 static void show_history_command(int8_t direction);
@@ -63,6 +83,11 @@ static void insert_char_at_cursor(char c);
 static void delete_char_at_cursor(void);
 static void redraw_from_cursor(void);
 static const char* format_uptime(uint32_t ms);
+static uint8_t find_command_matches(const char* partial, char matches[][MAX_CMD_LENGTH + 1], uint8_t max_matches);
+static uint8_t validate_command(const char* cmd);
+static void redraw_command_with_color(void);
+static void handle_tab_completion(void);
+static char* trim_string(char* str);
 
 // Thread-safe UART transmission helper
 static void safe_uart_transmit(const uint8_t* data, uint16_t size) {
@@ -96,7 +121,9 @@ void TerminalUI_ProcessInput(void) {
 }
 
 void TerminalUI_ShowBanner(void) {
-    TerminalUI_SendString("\r\n");
+    // Clear terminal and position cursor at top
+    TerminalUI_SendString("\033[2J\033[H");
+    
     TerminalUI_SendString(COLOR_MUTED "╭─────────────────────────────────────────╮\r\n");
     TerminalUI_SendString("│ " COLOR_ACCENT "STM32F767" COLOR_MUTED " Professional Terminal         │\r\n");
     TerminalUI_SendString("│ " COLOR_INFO "Multi-Sensor" COLOR_MUTED " • " COLOR_SUCCESS "HDC1080" COLOR_MUTED " • " COLOR_WARNING "ADXL345" COLOR_MUTED "    │\r\n");
@@ -128,6 +155,11 @@ void TerminalUI_ShowBanner(void) {
 }
 
 void TerminalUI_ShowPrompt(void) {
+    // Don't show normal prompt if we're in logs mode
+    if (logs_mode_active) {
+        HAL_UART_Receive_IT(&huart4, (uint8_t*)&rx_char, 1);  // Still need to receive input for logs mode
+        return;
+    }
     TerminalUI_SendString("\r\n" COLOR_PROMPT "root" COLOR_MUTED "@" COLOR_PROMPT "stm32" COLOR_MUTED ":" COLOR_ACCENT "~" COLOR_MUTED "$ " COLOR_RESET);
     HAL_UART_Receive_IT(&huart4, (uint8_t*)&rx_char, 1);
 }
@@ -149,43 +181,46 @@ void TerminalUI_PrintStatus(const char* message, const char* color) {
 }
 
 void TerminalUI_ProcessCommand(void) {
+    // Trim the command buffer to handle spaces properly
+    char* trimmed_cmd = trim_string((char*)cmd_buffer);
+    
     if (current_state == 0) { // Username
-        if (strcmp((char*)cmd_buffer, USERNAME) == 0) {
+        if (strcmp(trimmed_cmd, USERNAME) == 0) {
             TerminalUI_SendString(COLOR_MUTED "password: " COLOR_RESET);
             current_state = 1;
-            SystemLog_Add(LOG_INFO, "auth", "Valid username");
+            PersistentLog_Add(LOG_INFO, "auth", "Valid username");
         } else {
             TerminalUI_PrintStatus("Invalid username", COLOR_ERROR);
             TerminalUI_SendString(COLOR_MUTED "login: " COLOR_RESET);
-            SystemLog_Add(LOG_WARNING, "auth", "Invalid username");
+            PersistentLog_Add(LOG_WARNING, "auth", "Invalid username");
         }
     }
     else if (current_state == 1) { // Password
-        if (strcmp((char*)cmd_buffer, PASSWORD) == 0) {
+        if (strcmp(trimmed_cmd, PASSWORD) == 0) {
             TerminalUI_PrintStatus("Welcome! Type 'help' for commands", COLOR_SUCCESS);
             Sensors_UpdateAll();
             TerminalUI_ShowPrompt();
             current_state = 2;
             last_activity = xTaskGetTickCount();  // Use FreeRTOS tick count
-            SystemLog_Add(LOG_LOGIN, "auth", "Authentication successful");
+            PersistentLog_Add(LOG_LOGIN, "auth", "Authentication successful");
         } else {
             TerminalUI_PrintStatus("Access denied", COLOR_ERROR);
             TerminalUI_SendString(COLOR_MUTED "login: " COLOR_RESET);
             current_state = 0;
-            SystemLog_Add(LOG_ERROR, "auth", "Authentication failed");
+            PersistentLog_Add(LOG_ERROR, "auth", "Authentication failed");
         }
     }
     else if (current_state == 2) { // Logged in
-        if (strcmp((char*)cmd_buffer, "whoami") == 0) {
+        if (strcmp(trimmed_cmd, "whoami") == 0) {
             TerminalUI_PrintStatus("root", COLOR_INFO);
         }
-        else if (strncmp((char*)cmd_buffer, "led", 3) == 0) {
-            parse_led_command((char*)cmd_buffer);
+        else if (strncmp(trimmed_cmd, "led", 3) == 0) {
+            parse_led_command(trimmed_cmd);
         }
-        else if (strcmp((char*)cmd_buffer, "clear") == 0) {
+        else if (strcmp(trimmed_cmd, "clear") == 0) {
             TerminalUI_SendString("\033[2J\033[H");
         }
-        else if (strcmp((char*)cmd_buffer, "history") == 0) {
+        else if (strcmp(trimmed_cmd, "history") == 0) {
             TerminalUI_SendString(COLOR_INFO "Command History:\r\n" COLOR_RESET);
             for (uint8_t i = 0; i < history_count; i++) {
                 char msg[80];
@@ -193,36 +228,39 @@ void TerminalUI_ProcessCommand(void) {
                 TerminalUI_SendString(msg);
             }
         }
-        else if (strcmp((char*)cmd_buffer, "logs") == 0) {
-            SystemLog_Display();
+        else if (strcmp(trimmed_cmd, "logs") == 0) {
+            TerminalUI_EnterLogsMode();
         }
-
-        else if (strcmp((char*)cmd_buffer, "pflogs") == 0) {
-            PersistentLog_Display();
+        else if (strcmp(trimmed_cmd, "clear-logs") == 0) {
+            uint32_t log_count = PersistentLog_GetCount();
+            if (log_count == 0) {
+                TerminalUI_PrintStatus("No logs to clear", COLOR_INFO);
+            } else {
+                char warning[100];
+                sprintf(warning, "WARNING: This will permanently delete all %lu logs!", log_count);
+                TerminalUI_PrintStatus(warning, COLOR_WARNING);
+                TerminalUI_PrintStatus("Type 'confirm-clear-logs' to proceed", COLOR_ACCENT);
+            }
         }
-        else if (strcmp((char*)cmd_buffer, "pclear") == 0) {
+        else if (strcmp(trimmed_cmd, "confirm-clear-logs") == 0) {
             PersistentLog_EraseAll();
-            TerminalUI_PrintStatus("Persistent logs cleared", COLOR_SUCCESS);
+            TerminalUI_PrintStatus("All logs permanently deleted", COLOR_SUCCESS);
         }
-        else if (strcmp((char*)cmd_buffer, "ptest") == 0) {
-            SystemLog_AddPersistent(LOG_ERROR, "test", "Manual test log");
-            TerminalUI_PrintStatus("Test persistent log added", COLOR_SUCCESS);
-        }
-        else if (strcmp((char*)cmd_buffer, "status") == 0) {
+        else if (strcmp(trimmed_cmd, "status") == 0) {
             TerminalUI_ShowSystemInfo();
         }
-        else if (strcmp((char*)cmd_buffer, "uptime") == 0) {
+        else if (strcmp(trimmed_cmd, "uptime") == 0) {
             TerminalUI_ShowUptime();
         }
-        else if (strcmp((char*)cmd_buffer, "sensors") == 0) {
+        else if (strcmp(trimmed_cmd, "sensors") == 0) {
             Sensors_UpdateAll();
             TerminalUI_ShowAllSensors();
         }
-        else if (strcmp((char*)cmd_buffer, "accel") == 0) {
+        else if (strcmp(trimmed_cmd, "accel") == 0) {
             Sensors_UpdateAccel();
             TerminalUI_ShowDetailedAccel();
         }
-        else if (strcmp((char*)cmd_buffer, "climate") == 0) {
+        else if (strcmp(trimmed_cmd, "climate") == 0) {
             const ClimateData_t* climate = Sensors_GetClimate();
             TerminalUI_SendString(COLOR_INFO "Climate Data:\r\n" COLOR_RESET);
             TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
@@ -239,16 +277,16 @@ void TerminalUI_ProcessCommand(void) {
             }
             TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
         }
-        else if (strcmp((char*)cmd_buffer, "i2cscan") == 0) {
+        else if (strcmp(trimmed_cmd, "i2cscan") == 0) {
             TerminalUI_I2CScan();
         }
-        else if (strcmp((char*)cmd_buffer, "i2ctest") == 0) {
+        else if (strcmp(trimmed_cmd, "i2ctest") == 0) {
             TerminalUI_I2CTest();
         }
-        else if (strcmp((char*)cmd_buffer, "sensortest") == 0) {
+        else if (strcmp(trimmed_cmd, "sensortest") == 0) {
             Sensors_RunAllTests();
         }
-        else if (strcmp((char*)cmd_buffer, "tasks") == 0) {
+        else if (strcmp(trimmed_cmd, "tasks") == 0) {
             // FreeRTOS task monitoring
             TerminalUI_SendString(COLOR_INFO "FreeRTOS Task Information:\r\n" COLOR_RESET);
             TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
@@ -268,21 +306,21 @@ void TerminalUI_ProcessCommand(void) {
                    freeHeap, minFreeHeap);
             TerminalUI_SendString(heapMsg);
         }
-        else if (strcmp((char*)cmd_buffer, "stack") == 0) {
+        else if (strcmp(trimmed_cmd, "stack") == 0) {
             // Show stack usage for current task
             UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
             char stackMsg[60];
             sprintf(stackMsg, COLOR_INFO "Current task stack remaining: " COLOR_PRIMARY "%lu words\r\n", (unsigned long)uxHighWaterMark);
             TerminalUI_SendString(stackMsg);
         }
-        else if (strcmp((char*)cmd_buffer, "help") == 0) {
+        else if (strcmp(trimmed_cmd, "help") == 0) {
             TerminalUI_ShowHelp();
         }
-        else if (strcmp((char*)cmd_buffer, "logout") == 0) {
+        else if (strcmp(trimmed_cmd, "logout") == 0) {
             TerminalUI_Logout();
             return;
         }
-        else if (strlen((char*)cmd_buffer) == 0) {
+        else if (strlen(trimmed_cmd) == 0) {
             // Empty command - just show prompt
         }
         else {
@@ -308,7 +346,7 @@ void TerminalUI_Logout(void) {
     vTaskDelay(pdMS_TO_TICKS(300));  // Use FreeRTOS delay
     current_state = 0;
     last_activity = 0;
-    SystemLog_Add(LOG_LOGIN, "auth", "User logged out");
+    PersistentLog_Add(LOG_LOGIN, "auth", "User logged out");
     TerminalUI_ShowBanner();
 }
 
@@ -319,7 +357,7 @@ void TerminalUI_CheckTimeout(void) {
             TerminalUI_PrintStatus("Session timeout - automatically logged out", COLOR_WARNING);
             current_state = 0;
             last_activity = 0;
-            SystemLog_Add(LOG_LOGIN, "auth", "Session timeout");
+            PersistentLog_Add(LOG_LOGIN, "auth", "Session timeout");
             TerminalUI_ShowBanner();
         }
     }
@@ -332,7 +370,8 @@ void TerminalUI_ShowHelp(void) {
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "whoami" COLOR_MUTED "           Show current user\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "clear" COLOR_MUTED "            Clear terminal\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "history" COLOR_MUTED "          Show command history\r\n");
-    TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "logs" COLOR_MUTED "             Show system logs\r\n");
+    TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "logs" COLOR_MUTED "             Interactive log viewer\r\n");
+    TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "clear-logs" COLOR_MUTED "       Delete all logs (requires confirmation)\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "logout" COLOR_MUTED "           Exit session\r\n");
     TerminalUI_SendString("\r\n" COLOR_MUTED " " COLOR_ACCENT "System Information:" COLOR_RESET "\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "status" COLOR_MUTED "           Show comprehensive system status\r\n");
@@ -376,6 +415,12 @@ static char get_char_from_buffer(void) {
 }
 
 static void process_character(char c) {
+    // Handle logs mode input
+    if (logs_mode_active) {
+        TerminalUI_ProcessLogsMode(c);
+        return;
+    }
+
     if (c == '\r' || c == '\n') {
         if (cmd_index > MAX_CMD_LENGTH) {
             TerminalUI_PrintStatus("Command too long", COLOR_ERROR);
@@ -409,12 +454,21 @@ static void process_character(char c) {
         else if (c == 'D' && current_state == 2) move_cursor_left();
         return;
     }
+
+    if (c == '\t' && current_state == 2) {  // TAB key for auto-completion
+        handle_tab_completion();
+        return;
+    }
     escape_state = 0;
 
     if (c == 127 || c == 8) {
         if (cursor_pos > 0) {
             delete_char_at_cursor();
             current_history_pos = -1;
+            // Update coloring after any deletion to reflect current command state
+            if (current_state == 2) {
+                redraw_command_with_color();
+            }
         }
         return;
     }
@@ -423,6 +477,10 @@ static void process_character(char c) {
         if (cmd_index < MAX_CMD_LENGTH) {
             insert_char_at_cursor(c);
             current_history_pos = -1;
+            // Update coloring after any character insertion to reflect current command state
+            if (current_state == 2) {
+                redraw_command_with_color();
+            }
             last_activity = xTaskGetTickCount();  // Use FreeRTOS tick count
         } else {
             TerminalUI_SendString(COLOR_ERROR "!" COLOR_RESET);
@@ -490,6 +548,129 @@ static const char* format_uptime(uint32_t ms) {
     return uptime_str;
 }
 
+/**
+ * Find commands that match the partial input
+ */
+static uint8_t find_command_matches(const char* partial, char matches[][MAX_CMD_LENGTH + 1], uint8_t max_matches) {
+    uint8_t match_count = 0;
+    uint8_t partial_len = strlen(partial);
+    
+    if (partial_len == 0) return 0;  // No empty completions
+    
+    for (uint8_t i = 0; i < command_count && match_count < max_matches; i++) {
+        if (strncmp(valid_commands[i], partial, partial_len) == 0) {
+            strncpy(matches[match_count], valid_commands[i], MAX_CMD_LENGTH);
+            matches[match_count][MAX_CMD_LENGTH] = '\0';
+            match_count++;
+        }
+    }
+    
+    return match_count;
+}
+
+/**
+ * Trim whitespace from string (modifies original string)
+ */
+static char* trim_string(char* str) {
+    char* end;
+    
+    // Trim leading space
+    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
+    
+    if (*str == 0) return str;  // All spaces
+    
+    // Trim trailing space
+    end = str + strlen(str) - 1;
+    while (end > str && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) end--;
+    
+    // Write new null terminator
+    *(end + 1) = 0;
+    
+    return str;
+}
+
+/**
+ * Validate command and return status: 0=invalid, 1=partial, 2=valid
+ */
+static uint8_t validate_command(const char* cmd) {
+    // Create a trimmed copy for validation
+    char trimmed_cmd[MAX_CMD_LENGTH + 1];
+    strncpy(trimmed_cmd, cmd, MAX_CMD_LENGTH);
+    trimmed_cmd[MAX_CMD_LENGTH] = '\0';
+    trim_string(trimmed_cmd);
+    
+    uint8_t cmd_len = strlen(trimmed_cmd);
+    if (cmd_len == 0) return 0;
+    
+    // Extract just the first word (the base command) for validation
+    char base_cmd[MAX_CMD_LENGTH + 1];
+    strncpy(base_cmd, trimmed_cmd, MAX_CMD_LENGTH);
+    base_cmd[MAX_CMD_LENGTH] = '\0';
+    
+    // Find the first space to get just the command word
+    char* space_pos = strchr(base_cmd, ' ');
+    if (space_pos) {
+        *space_pos = '\0';  // Terminate at first space
+    }
+    
+    uint8_t base_len = strlen(base_cmd);
+    if (base_len == 0) return 0;
+    
+    uint8_t exact_match = 0;
+    uint8_t partial_match = 0;
+    
+    for (uint8_t i = 0; i < command_count; i++) {
+        if (strcmp(valid_commands[i], base_cmd) == 0) {
+            exact_match = 1;
+            break;
+        }
+        if (strncmp(valid_commands[i], base_cmd, base_len) == 0) {
+            partial_match = 1;
+        }
+    }
+    
+    if (exact_match) return 2;      // Valid complete command
+    if (partial_match) return 1;    // Partial match
+    return 0;                       // No match
+}
+
+/**
+ * Redraw command line with color coding (minimal cursor movement)
+ */
+static void redraw_command_with_color(void) {
+    if (current_state != 2 || cmd_index == 0) {
+        return;  // Only colorize during logged-in state with commands
+    }
+    
+    // Save cursor position and move to start of command
+    char move_to_start[10];
+    sprintf(move_to_start, "\033[%dD", cursor_pos);
+    TerminalUI_SendString(move_to_start);
+    
+    // Apply appropriate color based on current command validation
+    uint8_t validation = validate_command((char*)cmd_buffer);
+    switch (validation) {
+        case 0: TerminalUI_SendString(COLOR_ERROR); break;     // Invalid - red
+        case 1: TerminalUI_SendString(COLOR_WARNING); break;   // Partial - yellow  
+        case 2: TerminalUI_SendString(COLOR_SUCCESS); break;   // Valid - green
+        default: TerminalUI_SendString(COLOR_RESET); break;
+    }
+    
+    // Redraw command
+    for (uint8_t i = 0; i < cmd_index; i++) {
+        safe_uart_transmit((uint8_t*)&cmd_buffer[i], 1);
+    }
+    
+    // Reset color and clear any trailing characters
+    TerminalUI_SendString(COLOR_RESET "\033[K");
+    
+    // Move cursor back to original position
+    if (cursor_pos < cmd_index) {
+        char move_back[10];
+        sprintf(move_back, "\033[%dD", cmd_index - cursor_pos);
+        TerminalUI_SendString(move_back);
+    }
+}
 static void add_to_history(char* cmd) {
     if (history_count > 0 && strcmp(cmd, (char*)command_history[(history_index - 1 + HISTORY_SIZE) % HISTORY_SIZE]) == 0) {
         return;
@@ -618,5 +799,275 @@ static void redraw_from_cursor(void) {
         char move_cmd[10];
         sprintf(move_cmd, "\033[%dD", cmd_index - cursor_pos);
         TerminalUI_SendString(move_cmd);
+    }
+}
+
+// ===== LOGS MODE IMPLEMENTATION =====
+
+void TerminalUI_EnterLogsMode(void) {
+    uint32_t log_count = PersistentLog_GetCount();
+    
+    if (log_count == 0) {
+        TerminalUI_PrintStatus("No persistent logs found", COLOR_WARNING);
+        return;
+    }
+    
+    logs_mode_active = 1;
+    current_log_page = 0;
+    total_log_pages = (log_count + 9) / 10;  // 10 logs per page
+    
+    TerminalUI_SendString("\r\n");
+    TerminalUI_SendString(COLOR_ACCENT "╭────────────────────────────────────────╮\r\n");
+    TerminalUI_SendString("│" COLOR_RESET "          PERSISTENT LOGS MODE         " COLOR_ACCENT "│\r\n");
+    TerminalUI_SendString("╰────────────────────────────────────────╯" COLOR_RESET "\r\n");
+    
+    char info[100];
+    sprintf(info, "Found %lu logs across %lu pages\r\n\r\n", log_count, total_log_pages);
+    TerminalUI_SendString(info);
+    
+    // Display first page
+    display_logs_page(current_log_page);
+    show_logs_navigation();
+}
+
+void TerminalUI_ProcessLogsMode(char c) {
+    
+    switch (c) {
+        case 'n':
+        case 'N':
+            if (current_log_page < total_log_pages - 1) {
+                current_log_page++;
+                display_logs_page(current_log_page);
+                show_logs_navigation();
+            } else {
+                TerminalUI_SendString(COLOR_WARNING "Already on last page!" COLOR_RESET "\r\n");
+                show_logs_navigation();
+            }
+            break;
+            
+        case 'p':
+        case 'P':
+            if (current_log_page > 0) {
+                current_log_page--;
+                display_logs_page(current_log_page);
+                show_logs_navigation();
+            } else {
+                TerminalUI_SendString(COLOR_WARNING "Already on first page!" COLOR_RESET "\r\n");
+                show_logs_navigation();
+            }
+            break;
+            
+        case 'q':
+        case 'Q':
+            logs_mode_active = 0;
+            TerminalUI_SendString(COLOR_SUCCESS "Exiting logs mode..." COLOR_RESET "\r\n\r\n");
+            TerminalUI_ShowPrompt();
+            break;
+            
+        case 'h':
+        case 'H':
+            show_logs_help();
+            break;
+            
+        default:
+            TerminalUI_SendString(COLOR_ERROR "Invalid command! Press 'h' for help" COLOR_RESET "\r\n");
+            show_logs_navigation();
+            break;
+    }
+}
+
+uint8_t TerminalUI_IsInLogsMode(void) {
+    return logs_mode_active;
+}
+
+/**
+ * Display a specific page of logs
+ */
+static void display_logs_page(uint32_t page) {
+    // Clear screen and show header
+    TerminalUI_SendString("\033[2J\033[H");
+    
+    TerminalUI_SendString(COLOR_ACCENT "╭────────────────────────────────────────╮\r\n");
+    TerminalUI_SendString("│" COLOR_RESET "          PERSISTENT LOGS MODE         " COLOR_ACCENT "│\r\n");
+    TerminalUI_SendString("╰────────────────────────────────────────╯" COLOR_RESET "\r\n");
+    
+    char page_info[80];
+    sprintf(page_info, "Page %lu/%lu\r\n\r\n", page + 1, total_log_pages);
+    TerminalUI_SendString(page_info);
+    
+    // Get and display logs for this page
+    uint32_t start_idx = page * 10;
+    uint32_t logs_on_page = 0;
+    
+    volatile FlashLogHeader_t* header = (volatile FlashLogHeader_t*)0x08040000;
+    
+    // Find valid logs and display them
+    uint32_t displayed = 0;
+    for (uint32_t i = 0; i < 50 && displayed < 10; i++) {
+        if (header->logs[i].magic == 0xDEADBEEF) {
+            if (logs_on_page >= start_idx && logs_on_page < start_idx + 10) {
+                uint32_t seconds = header->logs[i].timestamp / 1000;
+                uint32_t minutes = seconds / 60;
+                uint32_t hours = minutes / 60;
+                
+                char log_line[150];
+                const char* level_color = get_level_color(header->logs[i].level);
+                sprintf(log_line, "%s%02lu. [%02lu:%02lu:%02lu] %s | %s: %s" COLOR_RESET "\r\n",
+                       level_color,
+                       logs_on_page + 1,
+                       hours % 24, minutes % 60, seconds % 60,
+                       get_level_name(header->logs[i].level),
+                       (char*)header->logs[i].module, 
+                       (char*)header->logs[i].message);
+                TerminalUI_SendString(log_line);
+                displayed++;
+            }
+            logs_on_page++;
+        }
+    }
+}
+
+/**
+ * Show navigation help in logs mode
+ */
+static void show_logs_navigation(void) {
+    TerminalUI_SendString("\r\n" COLOR_MUTED "╭─ NAVIGATION ────────────────────────────╮\r\n");
+    if (current_log_page > 0) {
+        TerminalUI_SendString("│ " COLOR_ACCENT "'p'" COLOR_MUTED " - Previous page                    │\r\n");
+    }
+    if (current_log_page < total_log_pages - 1) {
+        TerminalUI_SendString("│ " COLOR_ACCENT "'n'" COLOR_MUTED " - Next page                        │\r\n");
+    }
+    TerminalUI_SendString("│ " COLOR_ACCENT "'h'" COLOR_MUTED " - Help                             │\r\n");
+    TerminalUI_SendString("│ " COLOR_ACCENT "'q'" COLOR_MUTED " - Exit logs mode                   │\r\n");
+    TerminalUI_SendString("╰─────────────────────────────────────────╯" COLOR_RESET "\r\n");
+    TerminalUI_SendString(COLOR_ACCENT "logs> " COLOR_RESET);
+}
+
+/**
+ * Show detailed help for logs mode
+ */
+static void show_logs_help(void) {
+    TerminalUI_SendString("\r\n" COLOR_INFO "╭─ LOGS MODE HELP ────────────────────────╮\r\n");
+    TerminalUI_SendString("│ " COLOR_RESET "Commands available in logs mode:        " COLOR_INFO "│\r\n");
+    TerminalUI_SendString("│ " COLOR_ACCENT "'n'" COLOR_RESET " or " COLOR_ACCENT "'N'" COLOR_RESET " - Navigate to next page          " COLOR_INFO "│\r\n");
+    TerminalUI_SendString("│ " COLOR_ACCENT "'p'" COLOR_RESET " or " COLOR_ACCENT "'P'" COLOR_RESET " - Navigate to previous page      " COLOR_INFO "│\r\n");
+    TerminalUI_SendString("│ " COLOR_ACCENT "'q'" COLOR_RESET " or " COLOR_ACCENT "'Q'" COLOR_RESET " - Exit logs mode                 " COLOR_INFO "│\r\n");
+    TerminalUI_SendString("│ " COLOR_ACCENT "'h'" COLOR_RESET " or " COLOR_ACCENT "'H'" COLOR_RESET " - Show this help                 " COLOR_INFO "│\r\n");
+    TerminalUI_SendString("╰─────────────────────────────────────────╯" COLOR_RESET "\r\n");
+    show_logs_navigation();
+}
+
+/**
+ * Get color for log level
+ */
+static const char* get_level_color(LogLevel_t level) {
+    switch(level) {
+        case LOG_ERROR:   return COLOR_ERROR;
+        case LOG_WARNING: return COLOR_WARNING;
+        case LOG_INFO:    return COLOR_INFO;
+        case LOG_LOGIN:   return COLOR_ACCENT;
+        case LOG_SUCCESS: return COLOR_SUCCESS;
+        case LOG_SENSOR:  return COLOR_MUTED;
+        case LOG_DEBUG:   return COLOR_MUTED;
+        default:          return COLOR_RESET;
+    }
+}
+
+/**
+ * Get readable name for log level
+ */
+static const char* get_level_name(LogLevel_t level) {
+    switch(level) {
+        case LOG_ERROR:   return "ERROR";
+        case LOG_WARNING: return "WARN ";
+        case LOG_INFO:    return "INFO ";
+        case LOG_LOGIN:   return "LOGIN";
+        case LOG_SUCCESS: return "SUCCS";
+        case LOG_SENSOR:  return "SENSR";
+        case LOG_DEBUG:   return "DEBUG";
+        default:          return "UNKN ";
+    }
+}
+
+/**
+ * Handle TAB key for auto-completion
+ */
+static void handle_tab_completion(void) {
+    char matches[10][MAX_CMD_LENGTH + 1];
+    uint8_t match_count = find_command_matches((char*)cmd_buffer, matches, 10);
+    
+    if (match_count == 0) {
+        // Quick visual feedback - no cursor movement
+        TerminalUI_SendString(COLOR_ERROR "?" COLOR_RESET);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        TerminalUI_SendString("\b \b");  // Erase the ?
+    } else if (match_count == 1) {
+        // Complete the command smoothly
+        const char* complete_cmd = matches[0];
+        uint8_t current_len = strlen((char*)cmd_buffer);
+        uint8_t complete_len = strlen(complete_cmd);
+        
+        // Add only the missing characters
+        for (uint8_t i = current_len; i < complete_len; i++) {
+            if (cmd_index < MAX_CMD_LENGTH) {
+                cmd_buffer[cmd_index] = complete_cmd[i];
+                safe_uart_transmit((uint8_t*)&complete_cmd[i], 1);
+                cmd_index++;
+                cursor_pos++;
+            }
+        }
+        cmd_buffer[cmd_index] = '\0';
+        
+        // Update command colors after completion
+        redraw_command_with_color();
+        
+        // DON'T add space automatically - let user decide when to add parameters
+        // This prevents validation issues and gives better UX
+    } else {
+        // Multiple matches - find common prefix and complete it
+        uint8_t current_len = strlen((char*)cmd_buffer);
+        uint8_t common_len = current_len;
+        
+        // Find the longest common prefix among all matches
+        for (uint8_t pos = current_len; pos < MAX_CMD_LENGTH; pos++) {
+            char test_char = matches[0][pos];
+            if (test_char == '\0') break;
+            
+            uint8_t all_match = 1;
+            for (uint8_t i = 1; i < match_count; i++) {
+                if (matches[i][pos] != test_char || matches[i][pos] == '\0') {
+                    all_match = 0;
+                    break;
+                }
+            }
+            
+            if (all_match) {
+                common_len = pos + 1;
+            } else {
+                break;
+            }
+        }
+        
+        // If we can extend the current input, do it
+        if (common_len > current_len) {
+            for (uint8_t i = current_len; i < common_len; i++) {
+                if (cmd_index < MAX_CMD_LENGTH) {
+                    cmd_buffer[cmd_index] = matches[0][i];
+                    safe_uart_transmit((uint8_t*)&matches[0][i], 1);
+                    cmd_index++;
+                    cursor_pos++;
+                }
+            }
+            cmd_buffer[cmd_index] = '\0';
+            
+            // Update command colors after partial completion
+            redraw_command_with_color();
+        } else {
+            // No common prefix to complete - show a brief indicator
+            TerminalUI_SendString(COLOR_WARNING "+" COLOR_RESET);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            TerminalUI_SendString("\b \b");
+        }
     }
 }

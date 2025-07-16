@@ -31,4 +31,9 @@ void TerminalUI_ShowDetailedAccel(void);
 void TerminalUI_I2CScan(void);
 void TerminalUI_I2CTest(void);
 
+// Logs mode functions
+void TerminalUI_EnterLogsMode(void);
+void TerminalUI_ProcessLogsMode(char c);
+uint8_t TerminalUI_IsInLogsMode(void);
+
 #endif /* TERMINAL_UI_H */
