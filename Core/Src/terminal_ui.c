@@ -13,14 +13,20 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "persistent_logging.h"
+#include "user_config.h"
 
 // Configuration
 #define MAX_CMD_LENGTH 32
 #define RX_BUFFER_SIZE 64
-#define USERNAME "admin"
-#define PASSWORD "1234"
 #define HISTORY_SIZE 5
 #define SESSION_TIMEOUT_MS 300000
+
+// Account management states
+#define ACCOUNT_STATE_IDLE 0
+#define ACCOUNT_STATE_PASSWORD_VERIFY 1
+#define ACCOUNT_STATE_NEW_USERNAME 2
+#define ACCOUNT_STATE_NEW_PASSWORD 3
+#define ACCOUNT_STATE_CONFIRM_PASSWORD 4
 
 // UART buffer management
 static volatile char rx_buffer[RX_BUFFER_SIZE];
@@ -33,6 +39,11 @@ static volatile char cmd_buffer[MAX_CMD_LENGTH + 1];
 static volatile uint8_t cmd_index = 0;
 static volatile uint8_t cursor_pos = 0;
 static volatile uint8_t current_state = 0;  // 0=username, 1=password, 2=logged_in
+
+// Account management state
+static volatile uint8_t account_state = ACCOUNT_STATE_IDLE;
+static volatile char temp_new_username[MAX_USERNAME_LENGTH];
+static volatile char temp_new_password[MAX_PASSWORD_LENGTH];
 
 // Logs mode state
 static volatile uint8_t logs_mode_active = 0;
@@ -52,7 +63,7 @@ static volatile uint32_t last_activity = 0;
 // Command auto-completion and validation
 static const char* valid_commands[] = {
     "help", "whoami", "clear", "history", "logout",
-    "logs", "clear-logs", "confirm-clear-logs",
+    "logs", "clear-logs", "confirm-clear-logs", "account",
     "led", "status", "sensors", "uptime", "accel", "climate", 
     "i2cscan", "sensortest", "tasks", 
 };
@@ -82,6 +93,8 @@ static void move_cursor_right(void);
 static void insert_char_at_cursor(char c);
 static void delete_char_at_cursor(void);
 static void redraw_from_cursor(void);
+static void process_account_command(void);
+static void process_account_input(char* input);
 static const char* format_uptime(uint32_t ms);
 static uint8_t find_command_matches(const char* partial, char matches[][MAX_CMD_LENGTH + 1], uint8_t max_matches);
 static uint8_t validate_command(const char* cmd);
@@ -111,6 +124,10 @@ void TerminalUI_Init(void) {
     history_index = 0;
     current_history_pos = -1;
     last_activity = 0;
+    account_state = ACCOUNT_STATE_IDLE;
+    
+    // Initialize user configuration system
+    UserConfig_Init();
 }
 
 void TerminalUI_ProcessInput(void) {
@@ -185,7 +202,10 @@ void TerminalUI_ProcessCommand(void) {
     char* trimmed_cmd = trim_string((char*)cmd_buffer);
     
     if (current_state == 0) { // Username
-        if (strcmp(trimmed_cmd, USERNAME) == 0) {
+        char username_buffer[MAX_USERNAME_LENGTH];
+        UserConfig_GetCurrentUsername(username_buffer, MAX_USERNAME_LENGTH);
+        
+        if (strcmp(trimmed_cmd, username_buffer) == 0) {
             TerminalUI_SendString(COLOR_MUTED "password: " COLOR_RESET);
             current_state = 1;
             PersistentLog_Add(LOG_INFO, "auth", "Valid username");
@@ -196,7 +216,10 @@ void TerminalUI_ProcessCommand(void) {
         }
     }
     else if (current_state == 1) { // Password
-        if (strcmp(trimmed_cmd, PASSWORD) == 0) {
+        char username_buffer[MAX_USERNAME_LENGTH];
+        UserConfig_GetCurrentUsername(username_buffer, MAX_USERNAME_LENGTH);
+        
+        if (UserConfig_ValidateCredentials(username_buffer, trimmed_cmd)) {
             TerminalUI_PrintStatus("Welcome! Type 'help' for commands", COLOR_SUCCESS);
             Sensors_UpdateAll();
             TerminalUI_ShowPrompt();
@@ -320,6 +343,10 @@ void TerminalUI_ProcessCommand(void) {
             TerminalUI_Logout();
             return;
         }
+        else if (strcmp(trimmed_cmd, "account") == 0) {
+            process_account_command();
+            return;
+        }
         else if (strlen(trimmed_cmd) == 0) {
             // Empty command - just show prompt
         }
@@ -373,6 +400,7 @@ void TerminalUI_ShowHelp(void) {
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "logs" COLOR_MUTED "             Interactive log viewer\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "clear-logs" COLOR_MUTED "       Delete all logs (requires confirmation)\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "logout" COLOR_MUTED "           Exit session\r\n");
+    TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "account" COLOR_MUTED "          Change username and password\r\n");
     TerminalUI_SendString("\r\n" COLOR_MUTED " " COLOR_ACCENT "System Information:" COLOR_RESET "\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "status" COLOR_MUTED "           Show comprehensive system status\r\n");
     TerminalUI_SendString(COLOR_MUTED " " COLOR_ACCENT "uptime" COLOR_MUTED "           Show system uptime\r\n");
@@ -430,7 +458,13 @@ static void process_character(char c) {
             if (current_state == 2 && strlen((char*)cmd_buffer) > 0) {
                 add_to_history((char*)cmd_buffer);
             }
-            TerminalUI_ProcessCommand();
+            
+            // Check if we're in account management mode
+            if (account_state != ACCOUNT_STATE_IDLE) {
+                process_account_input((char*)cmd_buffer);
+            } else {
+                TerminalUI_ProcessCommand();
+            }
         }
         memset((void*)cmd_buffer, 0, sizeof(cmd_buffer));
         cmd_index = 0;
@@ -1069,5 +1103,143 @@ static void handle_tab_completion(void) {
             vTaskDelay(pdMS_TO_TICKS(150));
             TerminalUI_SendString("\b \b");
         }
+    }
+}
+
+// ===== ACCOUNT MANAGEMENT IMPLEMENTATION =====
+
+/**
+ * Process the account command - initiate credential change
+ */
+static void process_account_command(void) {
+    if (current_state != 2) {
+        TerminalUI_PrintStatus("Authentication required", COLOR_ERROR);
+        return;
+    }
+    
+    TerminalUI_SendString(COLOR_INFO "Account Management\r\n" COLOR_RESET);
+    TerminalUI_SendString(COLOR_MUTED "───────────────────────────────────────────\r\n" COLOR_RESET);
+    
+    char current_username[MAX_USERNAME_LENGTH];
+    UserConfig_GetCurrentUsername(current_username, MAX_USERNAME_LENGTH);
+    
+    char status_msg[80];
+    sprintf(status_msg, "Current user: %s", current_username);
+    TerminalUI_PrintStatus(status_msg, COLOR_INFO);
+    
+    if (UserConfig_IsUsingDefaults()) {
+        TerminalUI_PrintStatus("Using default credentials", COLOR_WARNING);
+    } else {
+        TerminalUI_PrintStatus("Using custom credentials", COLOR_SUCCESS);
+    }
+    
+    TerminalUI_SendString("\r\n" COLOR_WARNING "To change credentials, please enter your current password:\r\n");
+    TerminalUI_SendString(COLOR_MUTED "password: " COLOR_RESET);
+    
+    account_state = ACCOUNT_STATE_PASSWORD_VERIFY;
+}
+
+/**
+ * Process input during account management
+ */
+static void process_account_input(char* input) {
+    char* trimmed_input = trim_string(input);
+    
+    switch (account_state) {
+        case ACCOUNT_STATE_PASSWORD_VERIFY: {
+            char current_username[MAX_USERNAME_LENGTH];
+            UserConfig_GetCurrentUsername(current_username, MAX_USERNAME_LENGTH);
+            
+            if (UserConfig_ValidateCredentials(current_username, trimmed_input)) {
+                TerminalUI_PrintStatus("Password verified", COLOR_SUCCESS);
+                TerminalUI_SendString("\r\n" COLOR_INFO "Enter new username (3-15 chars): " COLOR_RESET);
+                account_state = ACCOUNT_STATE_NEW_USERNAME;
+            } else {
+                TerminalUI_PrintStatus("Invalid password - account change cancelled", COLOR_ERROR);
+                account_state = ACCOUNT_STATE_IDLE;
+                TerminalUI_ShowPrompt();
+            }
+            break;
+        }
+        
+        case ACCOUNT_STATE_NEW_USERNAME: {
+            if (strlen(trimmed_input) < 3 || strlen(trimmed_input) > 15) {
+                TerminalUI_PrintStatus("Username must be 3-15 characters", COLOR_ERROR);
+                TerminalUI_SendString(COLOR_INFO "Enter new username (3-15 chars): " COLOR_RESET);
+                return;
+            }
+            
+            // Check for invalid characters
+            for (int i = 0; trimmed_input[i]; i++) {
+                if (!isalnum((unsigned char)trimmed_input[i]) && trimmed_input[i] != '_' && trimmed_input[i] != '-') {
+                    TerminalUI_PrintStatus("Username can only contain letters, numbers, '_' and '-'", COLOR_ERROR);
+                    TerminalUI_SendString(COLOR_INFO "Enter new username (3-15 chars): " COLOR_RESET);
+                    return;
+                }
+            }
+            
+            strncpy((char*)temp_new_username, trimmed_input, MAX_USERNAME_LENGTH - 1);
+            temp_new_username[MAX_USERNAME_LENGTH - 1] = '\0';
+            
+            char confirm_msg[80];
+            sprintf(confirm_msg, "New username will be: %s", (char*)temp_new_username);
+            TerminalUI_PrintStatus(confirm_msg, COLOR_INFO);
+            
+            TerminalUI_SendString(COLOR_INFO "Enter new password (4-15 chars): " COLOR_RESET);
+            account_state = ACCOUNT_STATE_NEW_PASSWORD;
+            break;
+        }
+        
+        case ACCOUNT_STATE_NEW_PASSWORD: {
+            if (strlen(trimmed_input) < 4 || strlen(trimmed_input) > 15) {
+                TerminalUI_PrintStatus("Password must be 4-15 characters", COLOR_ERROR);
+                TerminalUI_SendString(COLOR_INFO "Enter new password (4-15 chars): " COLOR_RESET);
+                return;
+            }
+            
+            strncpy((char*)temp_new_password, trimmed_input, MAX_PASSWORD_LENGTH - 1);
+            temp_new_password[MAX_PASSWORD_LENGTH - 1] = '\0';
+            
+            TerminalUI_SendString(COLOR_INFO "Confirm new password: " COLOR_RESET);
+            account_state = ACCOUNT_STATE_CONFIRM_PASSWORD;
+            break;
+        }
+        
+        case ACCOUNT_STATE_CONFIRM_PASSWORD: {
+            if (strcmp((char*)temp_new_password, trimmed_input) == 0) {
+                // Passwords match - save new credentials
+                if (UserConfig_ChangeCredentials((char*)temp_new_username, (char*)temp_new_password)) {
+                    TerminalUI_SendString("\r\n");
+                    TerminalUI_PrintStatus("✓ Credentials successfully updated!", COLOR_SUCCESS);
+                    TerminalUI_PrintStatus("Your new credentials are now active", COLOR_INFO);
+                    
+                    char success_msg[100];
+                    sprintf(success_msg, "New user: %s", (char*)temp_new_username);
+                    TerminalUI_PrintStatus(success_msg, COLOR_ACCENT);
+                    
+                    // Clear temporary storage
+                    memset((void*)temp_new_username, 0, MAX_USERNAME_LENGTH);
+                    memset((void*)temp_new_password, 0, MAX_PASSWORD_LENGTH);
+                } else {
+                    TerminalUI_PrintStatus("✗ Failed to save new credentials", COLOR_ERROR);
+                    TerminalUI_PrintStatus("Please try again", COLOR_WARNING);
+                }
+            } else {
+                TerminalUI_PrintStatus("Passwords do not match", COLOR_ERROR);
+                TerminalUI_SendString(COLOR_INFO "Enter new password (4-15 chars): " COLOR_RESET);
+                account_state = ACCOUNT_STATE_NEW_PASSWORD;
+                return;
+            }
+            
+            account_state = ACCOUNT_STATE_IDLE;
+            TerminalUI_SendString("\r\n");
+            TerminalUI_ShowPrompt();
+            break;
+        }
+        
+        default:
+            account_state = ACCOUNT_STATE_IDLE;
+            TerminalUI_ShowPrompt();
+            break;
     }
 }

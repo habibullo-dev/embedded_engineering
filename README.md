@@ -176,6 +176,11 @@ The terminal features an intelligent command system with advanced capabilities:
 - `tasks` - FreeRTOS task monitoring with heap usage statistics
 - `memory` - System memory analysis and usage statistics
 
+**Account Management**:
+- `account` - Change username and password with secure verification
+- Interactive credential update with current password verification
+- Real-time validation and confirmation prompts
+
 **Log Management**:
 - `logs` - Interactive log viewer with pagination and filtering
 - `clear-logs` - Safe log deletion with confirmation prompt
@@ -190,6 +195,20 @@ The terminal features an intelligent command system with advanced capabilities:
 #define SESSION_TIMEOUT_MS 300000  // 5 minutes auto-logout
 ```
 
+### Account Management Configuration
+```c
+#define MAX_USERNAME_LENGTH 16
+#define MAX_PASSWORD_LENGTH 16
+#define USER_CONFIG_MAGIC 0xC0FABCD0
+
+// Account management states
+#define ACCOUNT_STATE_IDLE 0
+#define ACCOUNT_STATE_PASSWORD_VERIFY 1
+#define ACCOUNT_STATE_NEW_USERNAME 2
+#define ACCOUNT_STATE_NEW_PASSWORD 3
+#define ACCOUNT_STATE_CONFIRM_PASSWORD 4
+```
+
 ### Terminal Interface Settings
 ```c
 #define MAX_CMD_LENGTH 32          // Maximum command length
@@ -202,7 +221,7 @@ The terminal features an intelligent command system with advanced capabilities:
 // Valid commands array for auto-completion
 static const char* valid_commands[] = {
     "help", "whoami", "clear", "history", "logout",
-    "logs", "clear-logs", "confirm-clear-logs",
+    "logs", "clear-logs", "confirm-clear-logs", "account",
     "led", "status", "sensors", "uptime", "accel", 
     "climate", "i2cscan", "sensortest", "tasks"
 };
@@ -283,6 +302,58 @@ typedef struct {
    - Test auto-completion by typing partial commands and pressing TAB
    - Verify LED control with `led on 1` or `led on all`
 
+### Account Management Guide
+
+The system includes a powerful account management feature that allows you to change your username and password directly from the terminal without recompilation:
+
+#### Using the Account Command
+```bash
+account
+```
+
+#### Step-by-Step Process
+1. **Login**: Ensure you're logged in with current credentials
+2. **Execute Command**: Type `account` and press Enter
+3. **Current Password**: System prompts for your current password for security
+4. **New Username**: Enter your desired username (3-15 characters)
+   - Only letters, numbers, underscore (_), and hyphen (-) allowed
+   - Real-time validation with error feedback
+5. **New Password**: Enter your new password (4-15 characters)
+6. **Confirm Password**: Re-enter the new password to prevent typos
+7. **Automatic Save**: Credentials are immediately saved to flash memory
+8. **Instant Activation**: New credentials are active immediately
+
+#### Security Features
+- **Current Password Verification**: Must provide current password before changes
+- **Input Validation**: Username and password requirements enforced
+- **Character Filtering**: Only safe characters allowed in usernames
+- **Password Confirmation**: Double-entry prevents accidental typos
+- **Persistent Storage**: Credentials survive power cycles and firmware updates
+- **Comprehensive Logging**: All changes logged with timestamps and user information
+
+#### Example Session
+```bash
+admin@stm32:~$ account
+Account Management
+───────────────────────────────────────────
+Current user: admin
+Using default credentials
+
+To change credentials, please enter your current password:
+password: ****
+Password verified
+
+Enter new username (3-15 chars): myuser
+New username will be: myuser
+
+Enter new password (4-15 chars): ********
+Confirm new password: ********
+
+✓ Credentials successfully updated!
+Your new credentials are now active
+New user: myuser
+```
+
 ### First Commands to Try
 ```bash
 # Basic system information
@@ -305,6 +376,9 @@ accel
 led on 1
 led on all -t 10
 led off all
+
+# Account management
+account    # Change username/password
 
 # Advanced features
 tasks
@@ -414,6 +488,26 @@ The terminal implements a professional UART interface with advanced capabilities
 - **Password Security**: Character masking during input with asterisk display
 - **Activity Monitoring**: Comprehensive logging of all authentication events
 - **Automatic Logout**: Configurable timeout with grace period warnings
+
+### Dynamic Account Management
+- **Live Credential Updates**: Change username and password from the terminal without recompilation
+- **Secure Verification Process**: Current password verification required before changes
+- **Persistent Storage**: New credentials saved to flash memory and survive power cycles
+- **Input Validation**: 
+  - Username: 3-15 characters (alphanumeric, underscore, hyphen only)
+  - Password: 4-15 characters with confirmation prompt
+- **Real-Time Feedback**: Interactive prompts with status confirmation
+- **Fallback Protection**: Automatic revert to defaults if flash data is corrupted
+- **Comprehensive Logging**: All credential changes logged with timestamps
+
+#### Account Management Workflow
+1. **Access Control**: Only authenticated users can change credentials
+2. **Password Verification**: Current password required for security
+3. **Username Input**: New username with character validation
+4. **Password Setting**: New password with length requirements
+5. **Confirmation**: Password re-entry to prevent typos
+6. **Flash Storage**: Persistent save to dedicated flash sector
+7. **Immediate Activation**: New credentials active immediately
 
 ### Input Validation & Protection
 - **Buffer Overflow Protection**: Maximum command length enforcement (32 characters)
